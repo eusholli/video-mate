@@ -1,0 +1,12 @@
+__pycache__
+venv
+.env
+.git
+.gitignore
+*.pyc
+*.pyc
+
+log.txt
+ds/models/
+ds/storage/
+

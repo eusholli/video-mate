@@ -1,4 +1,4 @@
-# VideoRAG (Video Mate)
+# Video Mate
 
 A beautifully designed, intelligent video analytics and RAG (Retrieval-Augmented Generation) agent.
 
@@ -11,7 +11,7 @@ A beautifully designed, intelligent video analytics and RAG (Retrieval-Augmented
 
 ### 1. Backend Setup
 
-Prerequisites: Python 3.8+, FFmpeg.
+Prerequisites: Python 3.11, FFmpeg.
 
 ```bash
 cd backend
@@ -20,7 +20,11 @@ python -m venv venv
 source venv/bin/activate  # or venv\Scripts\activate on Windows
 
 # Install dependencies
+# 1. Install standard dependencies
 pip install -r requirements.txt
+
+# 2. Install ImageBind separately with the flag
+pip install --no-deps "git+https://github.com/facebookresearch/ImageBind.git@3fcf5c9039de97f6ff5528ee4a9dce903c5979b3"
 
 # Run the API server
 python videorag_api.py
@@ -41,10 +45,21 @@ npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) to view the application.
 
-## Configuration
+### 3. Docker Setup (Backend)
 
-The application uses a configuration file located at `frontend/ds/config.json`.
-On first launch, the frontend will automatically initialize the backend with settings from this file.
+You can also run the backend using Docker:
+
+```bash
+cd backend
+docker build -t videomate-backend .
+# Mount the models directory (requires models to be present locally)
+docker run -p 64451:64451 -v "$(pwd)/ds/models:/app/ds/models" videomate-backend
+```
+
+> **Note:** The `ds/models` directory is excluded from the image to keep it lightweight. You must mount your local models directory as shown above.
+
+
+
 
 ## Features
 
