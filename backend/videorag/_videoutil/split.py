@@ -14,16 +14,53 @@ def split_video(
     num_frames_per_segment,
     audio_output_format='mp3',
     audio_sample_rate=16000,  # Default 16kHz for speech recognition
+    resume=False,
 ):  
     unique_timestamp = str(int(time.time() * 1000))
     video_name = os.path.basename(video_path).split('.')[0]
     video_segment_cache_path = os.path.join(working_dir, '_cache', video_name)
+    
     if os.path.exists(video_segment_cache_path):
-        shutil.rmtree(video_segment_cache_path)
-    os.makedirs(video_segment_cache_path, exist_ok=False)
+        if not resume:
+            shutil.rmtree(video_segment_cache_path)
+            os.makedirs(video_segment_cache_path, exist_ok=False)
+        else:
+            logger.info(f"Resuming: Use existing cache directory {video_segment_cache_path}")
+    else:
+        os.makedirs(video_segment_cache_path, exist_ok=False)
     
     segment_index = 0
     segment_index2name, segment_times_info = {}, {}
+    
+    # RESUME LOGIC
+    if resume and os.path.exists(video_segment_cache_path):
+        existing_files = sorted([f for f in os.listdir(video_segment_cache_path) if f.endswith(f".{video_output_format}")])
+        if existing_files:
+            logger.info(f"Checking existing segments for resume: {len(existing_files)} files found.")
+            try:
+                for fname in existing_files:
+                    # fname format: timestamp-index-start-end.ext
+                    base = fname.rsplit('.', 1)[0]
+                    parts = base.split('-')
+                    if len(parts) >= 4:
+                        idx = parts[1]
+                        start = int(parts[2])
+                        end = int(parts[3])
+                        
+                        segment_index2name[idx] = base
+                        # Reconstruct frame times
+                        subvideo_length = end - start
+                        frame_times = np.linspace(0, subvideo_length, num_frames_per_segment, endpoint=False)
+                        frame_times += start
+                        segment_times_info[idx] = {"frame_times": frame_times, "timestamp": (start, end)}
+                        
+                logger.info(f"Successfully resumed splitting. Found {len(segment_index2name)} segments.")
+                return segment_index2name, segment_times_info
+            except Exception as e:
+                logger.warning(f"Resume failed (parsing error: {e}), restarting split process.")
+                segment_index2name, segment_times_info = {}, {} # Reset
+    
+    # NORMAL SPLIT LOGIC
     with VideoFileClip(video_path) as video:
     
         total_video_length = int(video.duration)
@@ -51,14 +88,17 @@ def split_video(
             audio_file = f'{audio_file_base_name}.{audio_output_format}'
             subaudio = subvideo.audio
             # Convert to mono and set sample rate using ffmpeg parameters
-            subaudio.write_audiofile(
-                os.path.join(video_segment_cache_path, audio_file), 
-                codec='mp3',
-                fps=audio_sample_rate,  # Set sample rate
-                ffmpeg_params=['-ac', '1'],  # Force mono (1 audio channel)
-                verbose=False, 
-                logger=None
-            )
+            try:
+                subaudio.write_audiofile(
+                    os.path.join(video_segment_cache_path, audio_file), 
+                    codec='mp3',
+                    fps=audio_sample_rate,  # Set sample rate
+                    ffmpeg_params=['-ac', '1'],  # Force mono (1 audio channel)
+                    verbose=False, 
+                    logger=None
+                )
+            except Exception as e:
+                logger.error(f"Audio write failed: {e}")
             
             segment_index += 1
 
@@ -71,6 +111,7 @@ def saving_video_segments(
     segment_index2name,
     segment_times_info,
     video_output_format='mp4',
+    resume=False,
 ):
     try:
         with VideoFileClip(video_path) as video:
@@ -78,8 +119,13 @@ def saving_video_segments(
             for index in tqdm(segment_index2name, desc=f"Saving Video Segments {video_name}"):
                 start, end = segment_times_info[index]["timestamp"][0], segment_times_info[index]["timestamp"][1]
                 video_file = f'{segment_index2name[index]}.{video_output_format}'
+                video_file_full_path = os.path.join(video_segment_cache_path, video_file)
+                
+                if resume and os.path.exists(video_file_full_path):
+                    continue
+                    
                 subvideo = video.subclip(start, end)
-                subvideo.write_videofile(os.path.join(video_segment_cache_path, video_file), codec='libx264', verbose=False, logger=None)
+                subvideo.write_videofile(video_file_full_path, codec='libx264', verbose=False, logger=None)
     except Exception as e:
         logger.error(f"Error in saving_video_segments:\n {str(e)}")
         raise RuntimeError

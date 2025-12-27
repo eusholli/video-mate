@@ -295,13 +295,14 @@ class VideoRAG:
         )
         self.safe_config["llm"] = asdict(self.llm)
 
-    def insert_video(self, video_path_list=None, progress_callback=None):
+    def insert_video(self, video_path_list=None, progress_callback=None, resume=False):
         """
         Insert videos and build index
         
         Args:
             video_path_list: 视频文件路径列表
             progress_callback: 进度回调函数，接收 (step_name, message) 参数
+            resume: Whether to resume from previous checkpoint (files)
         """
         if video_path_list is None:
             video_path_list = []
@@ -330,6 +331,7 @@ class VideoRAG:
                 self.rough_num_frames_per_segment,
                 self.audio_output_format,
                 self.audio_sample_rate,  # Pass the sample rate
+                resume=resume,
             )
             
             # Step2: obtain transcript with ASR (online)
@@ -356,6 +358,7 @@ class VideoRAG:
                     segment_index2name,
                     segment_times_info,
                     self.video_output_format,
+                    resume=resume,
             )
             
             # Pass the complete safe_config to segment_caption for LLM configuration

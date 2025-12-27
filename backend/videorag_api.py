@@ -18,6 +18,8 @@ import json
 import signal
 import atexit
 import psutil
+import hashlib
+import shutil
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from moviepy.editor import VideoFileClip
@@ -40,7 +42,6 @@ dashscope.base_websocket_api_url = (
 )
 # -----------------------------
 
-
 warnings.filterwarnings("ignore")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -51,7 +52,7 @@ from videorag._llm import (
     dashscope_caption_complete,
 )
 from videorag import VideoRAG, QueryParam
-
+from videorag.unified_storage import UnifiedNanoVectorDBStorage
 
 # Log recording function
 def log_to_file(message, log_file="log.txt"):
@@ -70,65 +71,44 @@ def log_to_file(message, log_file="log.txt"):
         print(f"[ERROR] Failed to write to log: {e}")
         print(f"[LOG] {message}")  # At least output to console
 
+# --- Helper Functions ---
 
-# New: JSON status management tool function
-def write_status_json(file_path: str, status_data: dict):
-    """Atomic write status JSON file"""
-    temp_file = file_path + ".tmp"
+def calculate_md5(file_path):
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def ensure_json_file(file_path, default=[]):
+    if not os.path.exists(file_path):
+        with open(file_path, 'w') as f:
+            json.dump(default, f)
+    with open(file_path, 'r') as f:
+        try:
+            return json.load(f)
+        except:
+            return default
+
+def save_json_file(file_path, data):
+    """Atomic save to prevent race conditions with readers"""
+    temp_path = f"{file_path}.tmp"
     try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(status_data, f, ensure_ascii=False, indent=2)
-        # Atomic rename
-        os.rename(temp_file, file_path)
+        with open(temp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno()) # Ensure write to disk
+        os.replace(temp_path, file_path) # Atomic switch
     except Exception as e:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except: pass
         raise e
 
-
-def read_status_json(file_path: str) -> dict:
-    """Read status JSON file"""
-    try:
-        if not os.path.exists(file_path):
-            return {}
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log_to_file(f"⚠️ Failed to read status file {file_path}: {str(e)}")
-        return {}
-
-
-def get_session_status_file(chat_id: str, base_storage_path: str) -> str:
-    """Get session status file path"""
-    session_dir = os.path.join(base_storage_path, f"chat-{chat_id}")
-    os.makedirs(session_dir, exist_ok=True)
-    return os.path.join(session_dir, "status.json")
-
-
-def update_session_status(
-    chat_id: str, base_storage_path: str, status_type: str, status_data: dict
-):
-    """Update session status"""
-    status_file = get_session_status_file(chat_id, base_storage_path)
-
-    # Read existing status
-    current_status = read_status_json(status_file)
-
-    # Update status data
-    if status_type not in current_status:
-        current_status[status_type] = {}
-
-    current_status[status_type].update(status_data)
-    current_status["last_updated"] = time.time()
-
-    # Write updated status
-    write_status_json(status_file, current_status)
-    log_to_file(f"📝 Updated {status_type} status for {chat_id}")
-
+# --- Managers ---
 
 class GlobalImageBindManager:
-    """Global ImageBind manager, providing HTTP API interface, supporting concurrent access control"""
-
+    """Global ImageBind manager, providing HTTP API interface"""
     def __init__(self):
         self.embedder = None
         self.is_initialized = False
@@ -136,678 +116,257 @@ class GlobalImageBindManager:
         self.usage_count = 0
         self.model_config = None
         self.model_path = None
-
-        # Simple thread lock to prevent concurrent access
         self._lock = threading.Lock()
 
     def initialize(self, model_path: str):
-        """Initialize configuration but do not load model"""
         with self._lock:
             self.model_path = model_path
             self.model_config = {"model_path": model_path, "configured_at": time.time()}
             self.is_initialized = True
-            log_to_file(
-                f"✅ ImageBind manager configured with model path: {model_path}"
-            )
-            return True
+            log_to_file(f"✅ ImageBind manager configured with model path: {model_path}")
 
     def ensure_imagebind_loaded(self):
-        """Ensure ImageBind model is loaded"""
         with self._lock:
-            if self.is_loaded:
-                log_to_file("⚠️ ImageBind already loaded")
-                return True
-
-            if not self.is_initialized or not self.model_path:
-                raise RuntimeError("ImageBind not initialized with model path")
-
+            if self.is_loaded: return True
+            if not self.is_initialized: raise RuntimeError("ImageBind not initialized")
+            
             try:
                 log_to_file("🔄 Loading ImageBind model...")
-
                 import torch
                 from imagebind.models.imagebind_model import ImageBindModel
                 from videorag._utils import get_imagebind_device
+                from videorag._videoutil import encode_video_segments, encode_string_query
 
                 device = get_imagebind_device()
-                log_to_file(f"📍 Using device for ImageBind: {device}")
-
                 self.embedder = ImageBindModel(
-                    vision_embed_dim=1280,
-                    vision_num_blocks=32,
-                    vision_num_heads=16,
-                    text_embed_dim=1024,
-                    text_num_blocks=24,
-                    text_num_heads=16,
-                    out_embed_dim=1024,
-                    audio_drop_path=0.1,
-                    imu_drop_path=0.7,
+                    vision_embed_dim=1280, vision_num_blocks=32, vision_num_heads=16,
+                    text_embed_dim=1024, text_num_blocks=24, text_num_heads=16,
+                    out_embed_dim=1024, audio_drop_path=0.1, imu_drop_path=0.7,
                 )
-
-                if not self.model_path or not os.path.exists(self.model_path):
-                    raise FileNotFoundError(
-                        f"ImageBind model not found at: {self.model_path}"
-                    )
-
-                self.embedder.load_state_dict(
-                    torch.load(self.model_path, map_location=device)
-                )
+                self.embedder.load_state_dict(torch.load(self.model_path, map_location=device))
                 self.embedder = self.embedder.to(device)
                 self.embedder.eval()
-
-                self.model_config.update(
-                    {"device": str(device), "loaded_at": time.time()}
-                )
-
                 self.is_loaded = True
                 log_to_file("✅ ImageBind model loaded successfully")
                 return True
-
             except Exception as e:
                 log_to_file(f"❌ Failed to load ImageBind: {str(e)}")
                 raise
 
     def release_imagebind(self):
-        """Release ImageBind model memory"""
         with self._lock:
-            if not self.is_loaded:
-                log_to_file("⚠️ ImageBind not loaded, nothing to release")
-                return True
-
-            try:
-                if self.embedder:
-                    # Clean up GPU memory
-                    if hasattr(self.embedder, "to"):
-                        self.embedder.to("cpu")
-                    del self.embedder
-                    import torch
-
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                self.embedder = None
-                self.is_loaded = False
-                log_to_file("🧹 ImageBind model released successfully")
-                return True
-
-            except Exception as e:
-                log_to_file(f"❌ Failed to release ImageBind: {str(e)}")
-                raise
+            if not self.is_loaded: return
+            self.embedder = None
+            import torch
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            self.is_loaded = False
 
     def encode_video_segments(self, video_batch: List[str]) -> np.ndarray:
-        """Encode video segments"""
         with self._lock:
-            if not self.is_loaded:
-                raise RuntimeError("ImageBind not loaded")
-
+            if not self.is_loaded: raise RuntimeError("ImageBind not loaded")
             self.usage_count += 1
-
             from videorag._videoutil import encode_video_segments
-
-            result = encode_video_segments(video_batch, self.embedder)
-            log_to_file(f"🎬 Encoded {len(video_batch)} video segments")
-            return result
+            return encode_video_segments(video_batch, self.embedder)
 
     def encode_string_query(self, query: str) -> np.ndarray:
-        """Encode string query"""
         with self._lock:
-            if not self.is_loaded:
-                raise RuntimeError("ImageBind not loaded")
-
+            if not self.is_loaded: raise RuntimeError("ImageBind not loaded")
             self.usage_count += 1
-
-            try:
-                from videorag._videoutil import encode_string_query
-
-                result = encode_string_query(query, self.embedder)
-                log_to_file(f"🔍 Encoded query: {query[:50]}...")
-                return result
-            except Exception as e:
-                log_to_file(f"❌ Query encoding failed: {str(e)}")
-                raise
-
+            from videorag._videoutil import encode_string_query
+            return encode_string_query(query, self.embedder)
+            
     def get_status(self) -> dict:
-        """Get status information"""
         with self._lock:
-            return {
-                "initialized": self.is_initialized,
-                "loaded": self.is_loaded,
-                "total_usage_count": self.usage_count,
-                "model_config": self.model_config,
-                "device": (
-                    str(next(self.embedder.parameters()).device)
-                    if self.embedder
-                    else None
-                ),
-            }
-
-    def cleanup(self):
-        """Clean up resources"""
-        self.release_imagebind()
-        with self._lock:
-            self.is_initialized = False
-            self.model_path = None
-            self.model_config = None
-            log_to_file("🧹 ImageBind manager cleaned up")
+            return {"initialized": self.is_initialized, "loaded": self.is_loaded}
 
 
 class HTTPImageBindClient:
-    """HTTP client, used for subprocess access to ImageBind service"""
-
+    """HTTP client for subprocesses"""
     def __init__(self, base_url: str = "http://localhost:64451"):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
 
     def encode_video_segments(self, video_batch: List[str]) -> np.ndarray:
-        """Encode video segments"""
-        try:
-            response = self.session.post(
-                f"{self.base_url}/api/imagebind/encode/video",
-                json={"video_batch": video_batch},
-                timeout=1800,  # 30min timeout
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-
-            result = response.json()
-            if not result.get("success"):
-                raise RuntimeError(f"API error: {result.get('error')}")
-
-            # Decode base64 string back to numpy array
-            result_b64 = result["result"]
-            result_bytes = base64.b64decode(result_b64)
-            embeddings = pickle.loads(result_bytes)
-            log_to_file(f"Received embeddings: {embeddings}")
-
-            return embeddings
-
-        except Exception as e:
-            log_to_file(f"❌ HTTP client video encoding error: {str(e)}")
-            raise
+        res = self.session.post(f"{self.base_url}/api/imagebind/encode/video", json={"video_batch": video_batch}, timeout=1800)
+        res.raise_for_status()
+        data = res.json()
+        if not data["success"]: raise RuntimeError(data["error"])
+        return pickle.loads(base64.b64decode(data["result"]))
 
     def encode_string_query(self, query: str) -> np.ndarray:
-        """Encode string query"""
-        try:
-            response = self.session.post(
-                f"{self.base_url}/api/imagebind/encode/query",
-                json={"query": query},
-                timeout=1800,  # 30min timeout
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-
-            result = response.json()
-            if not result.get("success"):
-                raise RuntimeError(f"API error: {result.get('error')}")
-
-            # Decode base64 string back to numpy array
-            result_b64 = result["result"]
-            result_bytes = base64.b64decode(result_b64)
-            embeddings = pickle.loads(result_bytes)
-
-            return embeddings
-
-        except Exception as e:
-            log_to_file(f"❌ HTTP client query encoding error: {str(e)}")
-            raise
-
+        res = self.session.post(f"{self.base_url}/api/imagebind/encode/query", json={"query": query}, timeout=1800)
+        res.raise_for_status()
+        data = res.json()
+        if not data["success"]: raise RuntimeError(data["error"])
+        return pickle.loads(base64.b64decode(data["result"]))
+        
     def get_status(self) -> dict:
-        """Get ImageBind service status"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/api/imagebind/status", timeout=30
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-
-            result = response.json()
-            if not result.get("success"):
-                raise RuntimeError(f"API error: {result.get('error')}")
-
-            return result["status"]
-
-        except Exception as e:
-            log_to_file(f"❌ HTTP client status check error: {str(e)}")
-            raise
+             res = self.session.get(f"{self.base_url}/api/imagebind/status", timeout=10)
+             return res.json().get("status", {})
+        except:
+            return {"loaded": False}
 
 
-class VideoRAGProcessManager:
-    """VideoRAG process manager - using JSON file to store state, removing Manager and Queue"""
+class LibraryManager:
+    def __init__(self, base_storage_path):
+        self.base_path = base_storage_path
+        self.library_dir = os.path.join(base_storage_path, "library")
+        self.library_json = os.path.join(self.library_dir, "library.json")
+        os.makedirs(self.library_dir, exist_ok=True)
 
-    def __init__(self):
-        self.global_config = None
-        self.running_processes = {}
+    def list_videos(self):
+        return ensure_json_file(self.library_json, [])
 
-    def set_global_config(self, config):
-        """Set global configuration"""
-        log_to_file(f"🔄 Global config set.")
-        self.global_config = config
-        return True
+    def get_video(self, video_id):
+        videos = self.list_videos()
+        for v in videos:
+            if v["id"] == video_id: return v
+        return None
 
-    def start_video_indexing(self, chat_id, video_path_list):
-        """Start video indexing process - using JSON status file"""
-        try:
-            # Initialize status file
-            base_storage_path = self.global_config.get("base_storage_path")
-            initial_status = {
-                "indexing_status": {
-                    "status": "processing",
-                    "message": "Initializing AI Assistant...",
-                    "current_step": "Initializing",
-                    "total_videos": len(video_path_list),
-                    "processed_videos": 0,
-                },
-                "indexed_videos": [],
-                "created_at": time.time(),
-            }
+    def add_video_entry(self, video_id, title, original_path):
+        videos = self.list_videos()
+        # Check if exists
+        for v in videos:
+            if v["id"] == video_id:
+                return v # Return existing
+        
+        new_entry = {
+            "id": video_id,
+            "title": title,
+            "original_path": original_path,
+            "status": "processing",
+            "created_at": time.time(),
+            "updated_at": time.time()
+        }
+        videos.append(new_entry)
+        save_json_file(self.library_json, videos)
+        return new_entry
 
-            status_file = get_session_status_file(chat_id, base_storage_path)
-            write_status_json(status_file, initial_status)
+    def update_status(self, video_id, status, error=None):
+        videos = self.list_videos()
+        for v in videos:
+            if v["id"] == video_id:
+                v["status"] = status
+                if error: v["error"] = error
+                v["updated_at"] = time.time()
+                save_json_file(self.library_json, videos)
+                return
 
-            # Get current server URL
-            server_url = f"http://localhost:{globals().get('SERVER_PORT', 64451)}"
+    def delete_video(self, video_id):
+        videos = self.list_videos()
+        videos = [v for v in videos if v["id"] != video_id]
+        save_json_file(self.library_json, videos)
+        
+        # Remove dir
+        video_dir = os.path.join(self.library_dir, video_id)
+        if os.path.exists(video_dir):
+            shutil.rmtree(video_dir)
 
-            # Create video indexing process
-            process = multiprocessing.Process(
-                target=index_video_worker_process,
-                args=(chat_id, video_path_list, self.global_config, server_url),
-            )
-            process.start()
+class SessionManager:
+    def __init__(self, base_storage_path):
+        self.sessions_dir = os.path.join(base_storage_path, "sessions")
+        self.sessions_json = os.path.join(self.sessions_dir, "sessions.json")
+        os.makedirs(self.sessions_dir, exist_ok=True)
 
-            # Record process
-            self.running_processes[chat_id] = {
-                "process": process,
-                "type": "video_indexing",
-                "chat_id": chat_id,
-                "started_at": time.time(),
-            }
+    def list_sessions(self):
+        return ensure_json_file(self.sessions_json, [])
 
-            return True
+    def create_session(self, name, video_ids):
+        sessions = self.list_sessions()
+        # sort list by updated_at
+        session_id = str(len(sessions) + 1)
+        # Assuming simple ID or uuid
+        import uuid
+        session_id = str(uuid.uuid4())
+        
+        new_session = {
+            "id": session_id,
+            "name": name,
+            "video_ids": video_ids,
+            "created_at": time.time(),
+            "last_active": time.time()
+        }
+        sessions.append(new_session)
+        save_json_file(self.sessions_json, sessions)
+        
+        # Create session dir
+        session_path = os.path.join(self.sessions_dir, session_id)
+        os.makedirs(session_path, exist_ok=True)
+        
+        return new_session
 
-        except Exception as e:
-            log_to_file(f"❌ Video indexing failed: {str(e)}")
-            raise
+    def delete_session(self, session_id):
+        sessions = self.list_sessions()
+        sessions = [s for s in sessions if s["id"] != session_id]
+        save_json_file(self.sessions_json, sessions)
+        
+        session_path = os.path.join(self.sessions_dir, session_id)
+        if os.path.exists(session_path):
+            shutil.rmtree(session_path)
 
-    def start_query_processing(self, chat_id, query):
-        """Start query processing process - using JSON status file"""
-        try:
-            # Initialize query status
-            base_storage_path = self.global_config.get("base_storage_path")
-            update_session_status(
-                chat_id,
-                base_storage_path,
-                "query_status",
-                {
-                    "status": "processing",
-                    "message": "Starting query processing...",
-                    "current_step": "Initializing",
-                    "query": query,
-                    "answer": None,
-                    "started_at": time.time(),
-                },
-            )
+    def get_session(self, session_id):
+        sessions = self.list_sessions()
+        for s in sessions:
+            if s["id"] == session_id: return s
+        return None
 
-            server_url = f"http://localhost:{globals().get('SERVER_PORT', 64451)}"
+    def update_last_active(self, session_id):
+        sessions = self.list_sessions()
+        for s in sessions:
+            if s["id"] == session_id:
+                s["last_active"] = time.time()
+                break
+        save_json_file(self.sessions_json, sessions)
 
-            # Create query processing process
-            process = multiprocessing.Process(
-                target=query_worker_process,
-                args=(chat_id, query, self.global_config, server_url),
-            )
-            process.start()
+# --- Global State ---
+global_imagebind_manager = GlobalImageBindManager()
+library_manager = None
+session_manager = None
 
-            # Record process
-            process_key = f"{chat_id}_query"
-            self.running_processes[process_key] = {
-                "process": process,
-                "type": "query_processing",
-                "chat_id": chat_id,
-                "started_at": time.time(),
-            }
+def get_library_manager():
+    global library_manager
+    if not library_manager:
+        config = load_and_init_global_config()[2] # Hack to get config
+        if config: library_manager = LibraryManager(config["base_storage_path"])
+    return library_manager
 
-            return True
+def get_session_manager():
+    global session_manager
+    if not session_manager:
+        config = load_and_init_global_config()[2]
+        if config: session_manager = SessionManager(config["base_storage_path"])
+    return session_manager
 
-        except Exception as e:
-            log_to_file(f"❌ Query processing failed: {str(e)}")
-            raise
+# --- Worker Processes ---
 
-    def terminate_process(self, chat_id):
-        """Terminate process"""
-        terminated = []
-
-        if chat_id in self.running_processes:
-            try:
-                process_info = self.running_processes[chat_id]
-                if process_info["process"].is_alive():
-                    log_to_file(f"🔥 Terminating process: {chat_id}")
-                    process_info["process"].terminate()
-                    process_info["process"].join(timeout=5)
-
-                    if process_info["process"].is_alive():
-                        log_to_file(f"💀 Force killing process: {chat_id}")
-                        process_info["process"].kill()
-                        process_info["process"].join()
-
-                terminated.append(chat_id)
-                del self.running_processes[chat_id]
-            except Exception as e:
-                log_to_file(f"⚠️ Process termination failed {chat_id}: {str(e)}")
-
-        # Update status file
-        if self.global_config:
-            base_storage_path = self.global_config.get("base_storage_path")
-            update_session_status(
-                chat_id,
-                base_storage_path,
-                "indexing_status",
-                {
-                    "status": "terminated",
-                    "message": "Process terminated by user",
-                    "current_step": "Terminated",
-                },
-            )
-
-        return terminated
-
-    def delete_session(self, chat_id):
-        """Delete session and its processes"""
-        try:
-            log_to_file(f"🗑️ Deleting session {chat_id}")
-            terminated = self.terminate_process(chat_id)
-            log_to_file(
-                f"🗑️ Deleted session {chat_id}, terminated processes: {terminated}"
-            )
-            return True
-        except Exception as e:
-            log_to_file(f"❌ Failed to delete session {chat_id}: {str(e)}")
-            return False
-
-    def get_session_status(self, chat_id, status_type="indexing"):
-        """Get session status from JSON file"""
-        if not self.global_config:
-            return None
-
-        try:
-            base_storage_path = self.global_config.get("base_storage_path")
-            status_file = get_session_status_file(chat_id, base_storage_path)
-            status_data = read_status_json(status_file)
-
-            if status_type == "query":
-                return status_data.get("query_status")
-            else:
-                return status_data.get("indexing_status")
-
-        except Exception as e:
-            log_to_file(f"❌ Failed to get session status: {str(e)}")
-            return None
-
-    def get_indexed_videos(self, chat_id):
-        """Get indexed video list"""
-        if not self.global_config:
-            return []
-
-        try:
-            base_storage_path = self.global_config.get("base_storage_path")
-            status_file = get_session_status_file(chat_id, base_storage_path)
-            status_data = read_status_json(status_file)
-            return status_data.get("indexed_videos", [])
-        except Exception as e:
-            log_to_file(f"❌ Failed to get indexed videos: {str(e)}")
-            return []
-
-    def get_process_status(self):
-        """Get all process status"""
-        status = {}
-        for key, process_info in self.running_processes.items():
-            status[key] = {
-                "type": process_info["type"],
-                "is_alive": process_info["process"].is_alive(),
-                "pid": process_info["process"].pid,
-                "started_at": process_info.get("started_at"),
-            }
-        return status
-
-    def get_all_sessions(self):
-        """Get all sessions history (both active and inactive)"""
-        if not self.global_config:
-            return []
-
-        try:
-            base_storage_path = self.global_config.get("base_storage_path")
-            sessions = []
-
-            if not os.path.exists(base_storage_path):
-                return []
-
-            # Scan directory
-            for entry in os.scandir(base_storage_path):
-                if entry.is_dir() and entry.name.startswith("chat-"):
-                    chat_id = entry.name[5:]  # Remove "chat-" prefix
-                    status_file = os.path.join(entry.path, "status.json")
-                    
-                    session_info = {
-                        "chat_id": chat_id,
-                        "created_at": entry.stat().st_ctime,
-                        "last_updated": entry.stat().st_mtime,
-                        "status": "unknown",
-                        "video_count": 0
-                    }
-
-                    # Try to read status file
-                    if os.path.exists(status_file):
-                        try:
-                            status_data = read_status_json(status_file)
-                            
-                            # Determine status
-                            indexing_status = status_data.get("indexing_status", {})
-                            if indexing_status.get("status") == "processing":
-                                session_info["status"] = "indexing"
-                            else:
-                                session_info["status"] = "ready"
-
-                            # Get video count
-                            indexed_videos = status_data.get("indexed_videos", [])
-                            session_info["video_count"] = len(indexed_videos)
-                            
-                            # Get last updated from file if available
-                            if "last_updated" in status_data:
-                                session_info["last_updated"] = status_data["last_updated"]
-                                
-                        except Exception:
-                            pass
-                            
-                    # Check if currently active in memory
-                    if chat_id in self.running_processes:
-                         session_info["status"] = "active_process"
-
-                    sessions.append(session_info)
-
-            # Sort by last updated desc
-            sessions.sort(key=lambda x: x["last_updated"], reverse=True)
-            return sessions
-
-        except Exception as e:
-            log_to_file(f"❌ Failed to get all sessions: {str(e)}")
-            return []
-
-    def cleanup(self):
-        """Clean up resources - force terminate all subprocesses"""
-        log_to_file("🧹 Starting process cleanup...")
-
-        # First try to gracefully terminate processes
-        for key, process_info in list(self.running_processes.items()):
-            try:
-                process = process_info["process"]
-                if process.is_alive():
-                    log_to_file(f"🔥 Terminating process: {key} (PID: {process.pid})")
-                    process.terminate()
-            except Exception as e:
-                log_to_file(f"⚠️ Error terminating process {key}: {str(e)}")
-
-        # Wait for processes to end
-        time.sleep(2)
-
-        # Force kill still alive processes
-        for key, process_info in list(self.running_processes.items()):
-            try:
-                process = process_info["process"]
-                if process.is_alive():
-                    log_to_file(f"💀 Force killing process: {key} (PID: {process.pid})")
-                    process.kill()
-                    process.join(timeout=3)
-            except Exception as e:
-                log_to_file(f"⚠️ Error killing process {key}: {str(e)}")
-
-        # Extra insurance: find and kill all related processes through psutil
-        try:
-            current_pid = os.getpid()
-            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-                try:
-                    proc_info = proc.info
-                    cmdline = proc_info.get("cmdline", [])
-                    if cmdline and len(cmdline) > 0:
-                        proc_name = cmdline[0]
-                        # Find videorag related processes (but exclude current main process)
-                        if proc_info["pid"] != current_pid and (
-                            "videorag-index-" in proc_name
-                            or "videorag-query-" in proc_name
-                        ):
-                            log_to_file(
-                                f"💀 Force killing orphan process: {proc_info['pid']} - {proc_name}"
-                            )
-                            proc.kill()
-                except (
-                    psutil.NoSuchProcess,
-                    psutil.AccessDenied,
-                    psutil.ZombieProcess,
-                ):
-                    continue
-        except Exception as e:
-            log_to_file(f"⚠️ Error during psutil cleanup: {str(e)}")
-
-        self.running_processes.clear()
-        log_to_file("🧹 Process manager cleanup completed")
-
-
-global_imagebind_manager = None
-process_manager = None
-
-
-def get_imagebind_manager():
-    """Get ImageBind manager, delayed initialization"""
-    global global_imagebind_manager
-    if global_imagebind_manager is None:
-        global_imagebind_manager = GlobalImageBindManager()
-    return global_imagebind_manager
-
-
-def get_process_manager():
-    """Get process manager, delayed initialization"""
-    global process_manager
-    if process_manager is None:
-        process_manager = VideoRAGProcessManager()
-    return process_manager
-
-
-# Process worker function
-def index_video_worker_process(chat_id, video_path_list, global_config, server_url):
-    """Process version of video indexing worker - using JSON status file, removing Queue"""
-    # IMMEDIATELY set process name before any other operations
-    process_name = f"videorag-index-{chat_id}"
+def ingest_worker_process(video_id, file_path, global_config, server_url, resume=False):
+    """
+    Worker to ingest a single video into library/<video_id>
+    """
+    import setproctitle
+    setproctitle.setproctitle(f"videorag-ingest-{video_id}")
+    
     try:
-        import setproctitle
+        lib_mgr = LibraryManager(global_config["base_storage_path"])
+        working_dir = os.path.join(lib_mgr.library_dir, video_id)
+        os.makedirs(working_dir, exist_ok=True)
+        
+        # Status callback
+        def progress_callback(step, msg):
+             # We could update a detailed status file in working_dir if needed
+             # For now, we rely on 'status.json' managed by split/resume logic
+             log_to_file(f"[{video_id}] {step}: {msg}")
 
-        setproctitle.setproctitle(process_name)
-        # Force set the argv[0] as backup
-        import sys
-
-        if hasattr(sys, "argv"):
-            sys.argv[0] = process_name
-    except ImportError:
-        import sys
-
-        if hasattr(sys, "argv"):
-            sys.argv[0] = process_name
-
-    # Log the process name setting for index worker
-    import os
-
-    log_to_file(f"🔧 Index worker process {os.getpid()} set name to: {process_name}")
-
-    try:
-        base_storage_path = global_config.get("base_storage_path")
-
-        # Define status update function
-        def update_status(status_data):
-            update_session_status(
-                chat_id, base_storage_path, "indexing_status", status_data
-            )
-
-        # Update video list function
-        def add_indexed_video(video_path):
-            status_file = get_session_status_file(chat_id, base_storage_path)
-            current_status = read_status_json(status_file)
-            if "indexed_videos" not in current_status:
-                current_status["indexed_videos"] = []
-            current_status["indexed_videos"].append(video_path)
-            current_status["last_updated"] = time.time()
-            write_status_json(status_file, current_status)
-
-        update_status(
-            {
-                "status": "processing",
-                "message": "Initializing AI Assistant...",
-                "current_step": "Initializing",
-            }
-        )
-
-        # Create HTTP ImageBind client
+        # Setup VideoRAG
         imagebind_client = HTTPImageBindClient(server_url)
-
-        # Verify ImageBind service availability and ensure loaded
-        try:
-            max_retries = 30
-            retry_interval = 2
+        
+        # Wait for LB
+        for i in range(30):
+            st = imagebind_client.get_status()
+            if st.get("loaded"): break
+            time.sleep(1)
             
-            for i in range(max_retries):
-                try:
-                    status = imagebind_client.get_status()
-                    
-                    if not status.get("initialized"):
-                        raise RuntimeError("ImageBind not initialized in main process")
-                        
-                    if status.get("loaded"):
-                        log_to_file("✅ ImageBind is loaded and ready")
-                        break
-                    
-                    if i == 0:
-                        log_to_file("⚠️ ImageBind not loaded, triggering auto-load...")
-                        # Trigger load
-                        try:
-                            requests.post(f"{server_url}/api/imagebind/load", timeout=5)
-                        except Exception as e:
-                            log_to_file(f"⚠️ Trigger load warning: {e}")
-                            
-                    log_to_file(f"⏳ Waiting for ImageBind to load... ({i+1}/{max_retries})")
-                    time.sleep(retry_interval)
-                    
-                except Exception as e:
-                    if i == max_retries - 1:
-                        raise e
-                    time.sleep(retry_interval)
-            else:
-                 raise RuntimeError("Timeout waiting for ImageBind to load")
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to connect/load ImageBind service: {str(e)}")
-
-        # Create VideoRAG instance
-        session_working_dir = os.path.join(base_storage_path, f"chat-{chat_id}")
-        os.makedirs(session_working_dir, exist_ok=True)
-
         videorag_llm_config = LLMConfig(
             embedding_func_raw=openai_embedding,
             embedding_model_name="text-embedding-3-small",
@@ -828,125 +387,232 @@ def index_video_worker_process(chat_id, video_path_list, global_config, server_u
             caption_model_name=global_config.get("caption_model"),
             caption_model_max_async=3,
         )
-
-        videorag_instance = VideoRAG(
+        
+        rag = VideoRAG(
             llm=videorag_llm_config,
-            working_dir=session_working_dir,
+            working_dir=working_dir,
             ali_dashscope_api_key=global_config.get("ali_dashscope_api_key"),
             ali_dashscope_base_url=global_config.get("ali_dashscope_base_url"),
             caption_model=global_config.get("caption_model"),
             asr_model=global_config.get("asr_model"),
             openai_api_key=global_config.get("openai_api_key"),
             openai_base_url=global_config.get("openai_base_url"),
-            imagebind_client=imagebind_client,  # Pass HTTP client
+            imagebind_client=imagebind_client,
         )
-
-        # Define progress callback - directly write to JSON file
-        def progress_callback(step_name, message, indexed_video_path=None):
-            status_data = {
-                "status": "processing" if step_name != "Completed" else "completed",
-                "message": message,
-                "current_step": step_name,
-            }
-            update_status(status_data)
-
-            # If a video is completed, add it to the indexed list
-            if indexed_video_path and step_name == "One Video Completed":
-                add_indexed_video(indexed_video_path)
-
-        # Call insert_video
-        videorag_instance.insert_video(
-            video_path_list=video_path_list, progress_callback=progress_callback
+        
+        # Rename file to <id>.mp4/etc to ensure consistent naming inside VideoRAG
+        # copy file to working dir
+        ext = os.path.splitext(file_path)[1]
+        target_path = os.path.join(working_dir, f"{video_id}{ext}")
+        if not os.path.exists(target_path):
+            shutil.copy2(file_path, target_path)
+            
+        rag.insert_video(
+            video_path_list=[target_path],
+            progress_callback=progress_callback,
+            resume=resume
         )
-
-        update_status(
-            {
-                "status": "completed",
-                "message": "All videos processed successfully",
-                "current_step": "Completed",
-            }
-        )
-
-        log_to_file(f"✅ Process-based video indexing completed: {chat_id}")
-
+        
+        lib_mgr.update_status(video_id, "ready")
+        log_to_file(f"✅ Ingestion complete for {video_id}")
+        
     except Exception as e:
-        base_storage_path = global_config.get("base_storage_path")
-        update_session_status(
-            chat_id,
-            base_storage_path,
-            "indexing_status",
-            {
-                "status": "error",
-                "message": f"Video indexing failed: {str(e)}",
-                "current_step": "Error",
-            },
-        )
-        log_to_file(f"❌ Process-based video indexing failed: {str(e)}")
+        log_to_file(f"❌ Ingestion failed for {video_id}: {e}")
+        lib_mgr = LibraryManager(global_config["base_storage_path"])
+        lib_mgr.update_status(video_id, "error", str(e))
 
-
-def query_worker_process(chat_id, query, global_config, server_url):
-    """Query processing worker process - using JSON status file, removing Queue"""
-    # IMMEDIATELY set process name before any other operations
-    process_name = f"videorag-query-{chat_id}"
+def query_worker_process(session_id, query, global_config, server_url):
+    """
+    Worker for querying. Sets up UnifiedStorage.
+    """
+    import setproctitle
+    setproctitle.setproctitle(f"videorag-query-{session_id}")
+    
     try:
-        import setproctitle
+        sess_mgr = SessionManager(global_config["base_storage_path"])
+        lib_mgr = LibraryManager(global_config["base_storage_path"])
+        
+        session = sess_mgr.get_session(session_id)
+        if not session: raise ValueError("Session not found")
+        
+        # Collect VDB paths
+        vdb_paths = []
+        for vid in session["video_ids"]:
+            # Library path: library/<vid>/vdb_chunks.json
+            p = os.path.join(lib_mgr.library_dir, vid, "vdb_chunks.json")
+            if os.path.exists(p):
+                vdb_paths.append(p)
+            else:
+                 # Check if video_segment_feature vdb exists? 
+                 # Unified storage usually just merges chunks (text) or all VDBs?
+                 # My UnifiedStorage impl looked for `unified_vdb_{namespace}.json`
+                 # and merged from source paths.
+                 pass
+        
+        # We need to unify "chunks" (for text retrieval) and maybe "entities"?
+        # For simplicity, UnifiedNanoVectorDBStorage implementation assumes it merges whatever is passed.
+        # VideoRAG uses multiple VDBs: entities, chunks, video_segment_feature.
+        # We need to merge ALL of them for "unified" experience?
+        # Or just Text Chunks?
+        # videorag_query checks entities_vdb, chunks_vdb, video_segment_feature_vdb.
+        # So we need Unified version for ALL 3 types.
+        
+        session_dir = os.path.join(sess_mgr.sessions_dir, session_id)
+        
+        # We need to PREPARE the unified DBs before querying?
+        # Or `UnifiedNanoVectorDBStorage` does it on init.
+        # We should do it here.
+        
+        # 1. Chunks
+        chunks_paths = [os.path.join(lib_mgr.library_dir, vid, "vdb_chunks.json") for vid in session["video_ids"]]
+        
+        # 2. Entities
+        entities_paths = [os.path.join(lib_mgr.library_dir, vid, "vdb_entities.json") for vid in session["video_ids"]]
+        
+        # 3. Video Features
+        features_paths = [os.path.join(lib_mgr.library_dir, vid, "vdb_video_segment_feature.json") for vid in session["video_ids"]]
 
-        setproctitle.setproctitle(process_name)
-        # Force set the argv[0] as backup
-        import sys
+        # Helper to init unified
+        async def init_unified(paths, namespace):
+             if not paths: return None
+             u = UnifiedNanoVectorDBStorage(
+                 namespace=namespace,
+                 global_config={"working_dir": session_dir, "llm": {"embedding_batch_num": 32}},
+                 embedding_func=openai_embedding, # Dummy, not used during merge really
+                 source_vdb_paths=paths
+             )
+             await u.initialize_session_db()
+             return u
 
-        if hasattr(sys, "argv"):
-            sys.argv[0] = process_name
-    except ImportError:
-        import sys
+        # We actually need to pass these configured classes to VideoRAG.
+        # VideoRAG instantiation is complex.
+        # We will dynamically override the storage classes used by this instance?
+        # Or just pass the Unified class type?
+        # VideoRAG accepts `vector_db_storage_cls`.
+        # usage: `self.chunks_vdb = self.vector_db_storage_cls(...)`
+        # But `UnifiedNanoVectorDBStorage` needs `source_vdb_paths`.
+        # Standard VideoRAG doesn't know how to pass `source_vdb_paths`.
+        
+        # Approach:
+        # We subclass VideoRAG or we just hack the instance.
+        # Or we pre-initialize the Unified DBs, and then tell VideoRAG to use `NanoVectorDBStorage` 
+        # but pointed to `unified_vdb_chunks.json`.
+        
+        # If we pre-initialize `unified_vdb_chunks.json` in `session_dir`,
+        # And then Initialize VideoRAG with `working_dir=session_dir` and namespace="chunks",
+        # `NanoVectorDBStorage` will look for `vdb_chunks.json`.
+        # My UnifiedStorage created `unified_vdb_chunks.json`.
+        # I should rename it to `vdb_chunks.json` inside the session dir!
+        # Then standard VideoRAG will pick it up as if it's a local VDB.
+        # THIS IS THE CLEANEST WAY! no code change in VideoRAG query logic.
+        
+        # So: Merge VDBs -> Save as `vdb_chunks.json` in session dir.
+        # VideoRAG(working_dir=session_dir) -> reads `vdb_chunks.json`.
+        
+        # Implementation of Merge:
+        from nano_vectordb import NanoVectorDB
+        
+        def merge_vdb(source_paths, target_path, dim):
+            # Create/Reset target
+            client = NanoVectorDB(dim, storage_file=target_path)
+            # Load sources
+            data_buffer = []
+            
+            for sp in source_paths:
+                if os.path.exists(sp):
+                    try:
+                        # Use NanoVectorDB to load the file (handles all decoding logic)
+                        source_client = NanoVectorDB(dim, storage_file=sp)
+                        
+                        # Access internal storage to get data and vectors
+                        # Name mangling for private attribute __storage
+                        storage = getattr(source_client, '_NanoVectorDB__storage', {})
+                        
+                        if isinstance(storage, dict) and "data" in storage and "matrix" in storage:
+                            items = storage["data"]
+                            matrix = storage["matrix"]
+                            
+                            # NanoVectorDB loads 'matrix' as a numpy array and 'data' as list
+                            # We can trust that loaded lengths match or are handled by lib
+                            valid_count = len(items)
+                            
+                            if len(matrix) >= valid_count:
+                                for i, item in enumerate(items):
+                                    new_item = item.copy() 
+                                    new_item["__vector__"] = matrix[i]
+                                    data_buffer.append(new_item)
+                            else:
+                                log_to_file(f"Mismatch in VDB {sp}: {valid_count} items vs {len(matrix)} vectors")
+                                
+                    except Exception as e:
+                        log_to_file(f"Failed to merge VDB {sp}: {e}")
 
-        if hasattr(sys, "argv"):
-            sys.argv[0] = process_name
+            if data_buffer:
+                # Upsert handles everything
+                client.upsert(data_buffer)
+                
+            client.save()
+            return True
+            
+        # Merge Chunks (Dim 1536)
+        merge_vdb(chunks_paths, os.path.join(session_dir, "vdb_chunks.json"), 1536)
+        # Merge Entities (Dim 1536)
+        merge_vdb(entities_paths, os.path.join(session_dir, "vdb_entities.json"), 1536)
+        # Merge Video Features (Dim 1024)
+        merge_vdb(features_paths, os.path.join(session_dir, "vdb_video_segment_feature.json"), 1024)
+        
+        # Also need to merge KVs? `text_chunks`, `video_segments`, `video_path`?
+        # VideoRAG uses `JsonKVStorage`.
+        # `text_chunks` (kv_store_text_chunks.json) - maps ID to content.
+        # Yes, we need these. `NanoVectorDB` only stores vectors + meta fields by ID.
+        # VideoRAG retrieves full content from KV store.
+        
+        def merge_kv(source_paths, target_path):
+             merged = {}
+             for sp in source_paths:
+                 if os.path.exists(sp):
+                     with open(sp, 'r') as f:
+                        d = json.load(f)
+                        merged.update(d)
+             with open(target_path, 'w') as f:
+                 json.dump(merged, f)
+                 
+        kv_chunks_paths = [os.path.join(lib_mgr.library_dir, vid, "kv_store_text_chunks.json") for vid in session["video_ids"]]
+        merge_kv(kv_chunks_paths, os.path.join(session_dir, "kv_store_text_chunks.json"))
+        
+        kv_segs_paths = [os.path.join(lib_mgr.library_dir, vid, "kv_store_video_segments.json") for vid in session["video_ids"]]
+        merge_kv(kv_segs_paths, os.path.join(session_dir, "kv_store_video_segments.json"))
+        
+        kv_paths_paths = [os.path.join(lib_mgr.library_dir, vid, "kv_store_video_path.json") for vid in session["video_ids"]]
+        merge_kv(kv_paths_paths, os.path.join(session_dir, "kv_store_video_path.json"))
 
-    # Log the process name setting for query worker
-    import os
-
-    log_to_file(f"🔧 Query worker process {os.getpid()} set name to: {process_name}")
-
-    try:
-        base_storage_path = global_config.get("base_storage_path")
-
-        # Define status update function
-        def update_query_status(status_data):
-            update_session_status(
-                chat_id, base_storage_path, "query_status", status_data
-            )
-
-        log_to_file(f"🔄 Starting query processing for chat {chat_id}: {query}")
-
-        # Step 1: Initializing
-        update_query_status(
-            {
-                "status": "processing",
-                "message": "Initializing query processing...",
-                "current_step": "Initializing",
-                "query": query,
-            }
-        )
-
-        # Create HTTP ImageBind client
-        imagebind_client = HTTPImageBindClient(server_url)
-
-        # Verify ImageBind service availability
+        # Merge Graph? (chunk_entity_relation)
+        # It's a graphml file? Or storage? 
+        # `NetworkXStorage` uses `graph_{namespace}.graphml`.
+        # Merging graphml files is harder. 
+        # But VideoRAG uses graph for `videorag_query` (GraphRAG).
+        # Should we assume Graph is per video and we just union them?
+        # NetworkX has `compose` or `union`.
+        # If we skip graph merge, GraphRAG might not see cross-video connections (which represents new knowledge anyway).
+        # We can try to load all graphs and merge them using networkx.
+        
         try:
-            status = imagebind_client.get_status()
-            if not status["initialized"]:
-                raise RuntimeError("ImageBind not initialized in main process")
+            import networkx as nx
+            G = nx.Graph()
+            for vid in session["video_ids"]:
+                gp = os.path.join(lib_mgr.library_dir, vid, "graph_chunk_entity_relation.graphml")
+                if os.path.exists(gp):
+                    g_sub = nx.read_graphml(gp)
+                    G = nx.compose(G, g_sub)
+            nx.write_graphml(G, os.path.join(session_dir, "graph_chunk_entity_relation.graphml"))
         except Exception as e:
-            raise RuntimeError(f"Failed to connect to ImageBind service: {str(e)}")
+            log_to_file(f"Graph merge failed: {e}")
 
-        # Create VideoRAG instance
-        session_working_dir = os.path.join(base_storage_path, f"chat-{chat_id}")
-        assert os.path.exists(
-            session_working_dir
-        ), f"Session working directory does not exist: {session_working_dir}"
-
+        # SETUP DONE. Now Query.
+        
+        imagebind_client = HTTPImageBindClient(server_url)
         videorag_llm_config = LLMConfig(
+             # Same config as usual
             embedding_func_raw=openai_embedding,
             embedding_model_name="text-embedding-3-small",
             embedding_dim=1536,
@@ -966,796 +632,303 @@ def query_worker_process(chat_id, query, global_config, server_url):
             caption_model_name=global_config.get("caption_model"),
             caption_model_max_async=3,
         )
-
-        videorag_instance = VideoRAG(
+        
+        rag = VideoRAG(
             llm=videorag_llm_config,
-            working_dir=session_working_dir,
+            working_dir=session_dir, # Points to Unified Data
             ali_dashscope_api_key=global_config.get("ali_dashscope_api_key"),
             ali_dashscope_base_url=global_config.get("ali_dashscope_base_url"),
             caption_model=global_config.get("caption_model"),
             asr_model=global_config.get("asr_model"),
             openai_api_key=global_config.get("openai_api_key"),
             openai_base_url=global_config.get("openai_base_url"),
-            imagebind_client=imagebind_client,  # Pass HTTP client
+            imagebind_client=imagebind_client,
         )
-
-        # Step 2: Processing
-        update_query_status(
-            {
-                "status": "processing",
-                "message": "Processing your query...",
-                "current_step": "Processing",
-                "query": query,
-            }
-        )
-
+        
+        
         param = QueryParam(mode="videorag")
         param.wo_reference = True
-        response = videorag_instance.query(query=query, param=param)
-
-        # Step 3: Completed
-        update_query_status(
-            {
-                "status": "completed",
-                "message": "Query processing completed",
-                "current_step": "Completed",
-                "query": query,
-                "answer": response,
-            }
-        )
-
-        log_to_file(f"✅ Query processing completed for chat {chat_id}")
-
-    except Exception as e:
-        base_storage_path = global_config.get("base_storage_path")
-        update_session_status(
-            chat_id,
-            base_storage_path,
-            "query_status",
-            {
-                "status": "error",
-                "message": f"Query processing failed: {str(e)}",
-                "current_step": "Error",
-                "query": query,
-            },
-        )
-        log_to_file(f"❌ Query processing failed: {str(e)}")
-
-
-# Helper function for configuration loading
-def load_and_init_global_config():
-    """Load configuration from environment variables and initialize global state."""
-    try:
-        # Load configuration from environment variables
-        config = {
-            "ali_dashscope_api_key": os.getenv("DASHSCOPE_API_KEY"),
-            "ali_dashscope_base_url": os.getenv("DASHSCOPE_BASE_URL"),
-            "openai_api_key": os.getenv("OPENAI_API_KEY"),
-            "openai_base_url": os.getenv("OPENAI_BASE_URL"),
-            "caption_model": os.getenv("CAPTION_MODEL"),
-            "asr_model": os.getenv("ASR_MODEL"),
-            "analysisModel": os.getenv("ANALYSIS_MODEL"),
-            "processingModel": os.getenv("PROCESSING_MODEL"),
-            "base_storage_path": os.getenv("BASE_STORAGE_PATH"),
-            "image_bind_model_path": os.getenv("IMAGE_BIND_MODEL_PATH"),
-        }
-
-        # Validating critical configuration
-        required_keys = ["ali_dashscope_api_key", "openai_api_key", "base_storage_path", "image_bind_model_path"]
-        missing_keys = [key for key in required_keys if not config.get(key)]
+        response = rag.query(query=query, param=param)
         
-        if missing_keys:
-            error_msg = f"Missing required environment variables: {', '.join(missing_keys)}"
-            log_to_file(f"❌ Configuration error: {error_msg}")
-            return False, error_msg
-
-        get_process_manager().set_global_config(config)
-
-        # Initialize ImageBind manager configuration AND load model
-        model_path = config.get("image_bind_model_path")
-        if model_path:
-            get_imagebind_manager().initialize(model_path)
-            # Automatically load the model
-            log_to_file("🚀 Auto-loading ImageBind model...")
-            get_imagebind_manager().ensure_imagebind_loaded()
-            
-        return True, "VideoRAG system configuration set successfully from environment variables"
+        # History Handling
+        history_file = os.path.join(session_dir, "history.json")
+        history = ensure_json_file(history_file, [])
+        
+        # NOTE: User message is already appended by endpoint.
+        
+        # Append AI Msg
+        history.append({
+            "role": "assistant", 
+            "content": response, 
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+        save_json_file(history_file, history)
+        
+        # Update Status
+        status_file = os.path.join(session_dir, "status.json")
+        res = {"query_status": {"status": "completed", "answer": response, "query": query}}
+        save_json_file(status_file, res)
+        
+        # Update Session Last Active
+        # We need to lock or be careful with session.json if multiple write?
+        # SessionManager writes to single sessions.json.
+        # Worker process should probably NOT write to sessions.json directly if concurrency is high.
+        # But for MVP, we can read-modify-write.
+        try:
+            sm = SessionManager(global_config["base_storage_path"])
+            # reload to get fresh
+            sessions = sm.list_sessions()
+            for s in sessions:
+                if s["id"] == session_id:
+                    s["last_active"] = time.time()
+                    break
+            save_json_file(sm.sessions_json, sessions)
+        except Exception: pass
+        
     except Exception as e:
-        log_to_file(f"❌ Load config error: {str(e)}")
-        return False, str(e)
+        log_to_file(f"Query Process Failed: {e}")
+        # Update status
+        try:
+            status_file = os.path.join(sess_mgr.sessions_dir, session_id, "status.json")
+            save_json_file(status_file, {"query_status": {"status": "error", "message": str(e)}})
+        except: pass
 
 
-# Flask application factory function
+# --- Flask App ---
+
+def load_and_init_global_config():
+    config = {
+        "ali_dashscope_api_key": os.getenv("DASHSCOPE_API_KEY"),
+        "ali_dashscope_base_url": os.getenv("DASHSCOPE_BASE_URL"),
+        "openai_api_key": os.getenv("OPENAI_API_KEY"),
+        "openai_base_url": os.getenv("OPENAI_BASE_URL"),
+        "caption_model": os.getenv("CAPTION_MODEL"),
+        "asr_model": os.getenv("ASR_MODEL"),
+        "analysisModel": os.getenv("ANALYSIS_MODEL"),
+        "processingModel": os.getenv("PROCESSING_MODEL"),
+        "base_storage_path": os.getenv("BASE_STORAGE_PATH"),
+        "image_bind_model_path": os.getenv("IMAGE_BIND_MODEL_PATH"),
+    }
+    # Init ImageBind
+    if config["image_bind_model_path"]:
+        global_imagebind_manager.initialize(config["image_bind_model_path"])
+        # We assume auto-load?
+        # global_imagebind_manager.ensure_imagebind_loaded() 
+    return True, "Config Loaded", config
+
 def create_app():
-    """Create Flask application instance"""
     app = Flask(__name__)
     CORS(app)
-
-    # Register all routes
-    register_routes(app)
-
-    return app
-
-
-def register_routes(app):
-    """Register all routes to Flask application"""
+    
+    # Load config on startup
+    load_and_init_global_config()
 
     @app.route("/api/health", methods=["GET"])
     def health_check():
-        """Health check"""
-        return jsonify({"status": "ok", "message": "VideoRAG API is running"})
-
-    @app.route("/api/video/duration", methods=["POST"])
-    def get_video_duration():
-        """Get video duration information"""
-        try:
-            data = request.json
-            video_path = data.get("video_path")
-            with VideoFileClip(video_path) as clip:
-                duration = clip.duration
-                fps = clip.fps
-                size = clip.size
-                result = {
-                    "success": True,
-                    "duration": duration,
-                    "fps": fps,
-                    "width": size[0],
-                    "height": size[1],
-                    "video_path": video_path,
-                }
-            log_to_file(f"🔍 Video duration: {result}")
-            return jsonify(result)
-        except Exception as e:
-            log_to_file(f"❌ Video duration extraction error: {str(e)}")
-            return (
-                jsonify(
-                    {"success": False, "error": f"Duration extraction error: {str(e)}"}
-                ),
-                500,
-            )
-
-
-
-
-
+        return jsonify({"status": "ok"})
+        
     @app.route("/api/initialize", methods=["POST"])
-    def initialize_system():
-        """Initialize system configuration from environment variables."""
-        try:
-            success, message = load_and_init_global_config()
+    def initialize():
+        s, m, _ = load_and_init_global_config()
+        return jsonify({"success": s, "message": m})
+
+    # --- Library Endpoints ---
+    @app.route("/api/library", methods=["GET"])
+    def list_library():
+        lm = get_library_manager()
+        return jsonify({"success": True, "videos": lm.list_videos()})
+        
+    @app.route("/api/library/ingest", methods=["POST"])
+    def ingest_video():
+        data = request.json
+        path = data.get("path")
+        resume = data.get("resume", True) # Default to True for UX
+        if not path or not os.path.exists(path):
+            return jsonify({"success": False, "error": "Invalid path"}), 400
             
-            if not success:
-                return jsonify({"success": False, "error": message}), 500
+        lm = get_library_manager()
+        
+        # Calculate ID
+        video_id = calculate_md5(path)
+        filename = os.path.basename(path)
+        
+        # Add to Library (or get existing)
+        entry = lm.add_video_entry(video_id, filename, path)
+        
+        if entry['status'] == 'ready' and not resume:
+             # If strictly not resuming and already ready, maybe return?
+             # But usually ingestion is idempotent-ish with resume=True.
+             pass
 
-            return jsonify(
-                {
-                    "success": True,
-                    "message": message,
-                    "imagebind_status": get_imagebind_manager().get_status(),
-                }
-            )
+        # Start Process
+        success, _, config = load_and_init_global_config()
+        server_url = f"http://localhost:{globals().get('SERVER_PORT', 64451)}"
+        
+        p = multiprocessing.Process(target=ingest_worker_process, args=(video_id, path, config, server_url, resume))
+        p.start()
+        
+        return jsonify({"success": True, "status": "processing", "video_id": video_id})
 
+    @app.route("/api/library/upload", methods=["POST"])
+    def upload_video():
+        if 'file' not in request.files:
+            return jsonify({"success": False, "error": "No file part"}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"success": False, "error": "No selected file"}), 400
+            
+        if file:
+            _, _, config = load_and_init_global_config()
+            base_dir = config["base_storage_path"]
+            upload_dir = os.path.join(base_dir, "uploads")
+            os.makedirs(upload_dir, exist_ok=True)
+            
+            filename = file.filename
+            safe_name = f"{int(time.time())}_{filename}"
+            save_path = os.path.join(upload_dir, safe_name)
+            
+            file.save(save_path)
+            
+            return jsonify({
+                "success": True, 
+                "path": os.path.abspath(save_path),
+                "filename": filename
+            })
+        
+    @app.route("/api/library/<video_id>", methods=["DELETE"])
+    def delete_video(video_id):
+        lm = get_library_manager()
+        lm.delete_video(video_id)
+        return jsonify({"success": True})
+
+    # --- Session Endpoints ---
+    @app.route("/api/sessions", methods=["GET"])
+    def list_sessions():
+        sm = get_session_manager()
+        return jsonify({"success": True, "sessions": sm.list_sessions()})
+        
+    @app.route("/api/sessions", methods=["POST"])
+    def create_session():
+        data = request.json
+        name = data.get("name")
+        video_ids = data.get("video_ids", [])
+        sm = get_session_manager()
+        session = sm.create_session(name, video_ids)
+        return jsonify({"success": True, "session": session})
+        
+    @app.route("/api/sessions/<session_id>", methods=["DELETE"])
+    def delete_session(session_id):
+        sm = get_session_manager()
+        sm.delete_session(session_id)
+        return jsonify({"success": True})
+        
+    @app.route("/api/sessions/<session_id>", methods=["GET"])
+    def get_session_details(session_id):
+        sm = get_session_manager()
+        
+        session = sm.get_session(session_id)
+        if not session:
+            return jsonify({"success": False, "error": "Not found"}), 404
+            
+        # Get History
+        history_path = os.path.join(sm.sessions_dir, session_id, "history.json")
+        history = ensure_json_file(history_path, [])
+        
+        # Get Status
+        status_path = os.path.join(sm.sessions_dir, session_id, "status.json")
+        status = ensure_json_file(status_path, {})
+        
+        return jsonify({
+            "success": True, 
+            "session": session, 
+            "history": history, 
+            "status": status.get("query_status")
+        })
+
+    @app.route("/api/sessions/<session_id>/query", methods=["POST"])
+    def query_session(session_id):
+        data = request.json
+        query = data.get("query")
+        
+        _, _, config = load_and_init_global_config()
+        server_url = f"http://localhost:{globals().get('SERVER_PORT', 64451)}"
+        
+        # 1. Update History synchronously (Main Thread)
+        sm = get_session_manager()
+        history_path = os.path.join(sm.sessions_dir, session_id, "history.json")
+        try:
+             history = ensure_json_file(history_path, [])
+             history.append({
+                 "role": "user", 
+                 "content": query, 
+                 "timestamp": datetime.datetime.now().isoformat()
+             })
+             with open(history_path, 'w') as f:
+                 json.dump(history, f, indent=2)
+                 
+             # Update Last Active
+             sm.update_last_active(session_id)
+             
+             # Update Status to Processing immediately
+             status_path = os.path.join(sm.sessions_dir, session_id, "status.json")
+             save_json_file(status_path, {"query_status": {"status": "processing"}})
+             
         except Exception as e:
-            log_to_file(f"❌ Configuration error: {str(e)}")
-            return (
-                jsonify({"success": False, "error": f"Configuration error: {str(e)}"}),
-                500,
-            )
+             log_to_file(f"Failed to sync save history/status: {e}")
+        
+        # 2. Spawn Worker for AI Response
+        p = multiprocessing.Process(target=query_worker_process, args=(session_id, query, config, server_url))
+        p.start()
+        
+        return jsonify({"success": True, "status": "processing"})
+        
+    @app.route("/api/sessions/<session_id>/status", methods=["GET"])
+    def get_query_status(session_id):
+        # ... existing implementation is fine, but maybe redundant if get_session_details exists
+        pass # keeping old endpoint just in case, or remove if unused.
+        sm = get_session_manager()
+        p = os.path.join(sm.sessions_dir, session_id, "status.json")
+        if os.path.exists(p):
+             with open(p, 'r') as f:
+                 return jsonify({"success": True, "status": json.load(f).get("query_status")})
+        return jsonify({"success": False, "status": "unknown"})
 
+    # --- ImageBind Internal ---
     @app.route("/api/imagebind/status", methods=["GET"])
-    def get_imagebind_status():
-        """获取ImageBind状态"""
-        try:
-            status = get_imagebind_manager().get_status()
-            return jsonify({"success": True, "status": status})
-        except Exception as e:
-            return (
-                jsonify({"success": False, "error": f"Status check error: {str(e)}"}),
-                500,
-            )
-
+    def ib_status():
+        return jsonify({"success": True, "status": global_imagebind_manager.get_status()})
+        
     @app.route("/api/imagebind/encode/video", methods=["POST"])
-    def encode_video_segments_api():
-        """编码视频段的API接口"""
+    def ib_encode_video():
         try:
-            data = request.json
-            video_batch = data.get("video_batch", [])
-
-            if not video_batch:
-                return (
-                    jsonify({"success": False, "error": "video_batch is required"}),
-                    400,
-                )
-
-            # Verify file existence
-            for video_path in video_batch:
-                if not os.path.exists(video_path):
-                    return (
-                        jsonify(
-                            {
-                                "success": False,
-                                "error": f"Video file not found: {video_path}",
-                            }
-                        ),
-                        400,
-                    )
-
-            # Encode video
-            log_to_file(f"🎬 Encoding {video_batch} video segments")
-            result = get_imagebind_manager().encode_video_segments(video_batch).numpy()
-            # Convert numpy array to base64 string for transmission
-            result_bytes = pickle.dumps(result)
-            result_b64 = base64.b64encode(result_bytes).decode("utf-8")
-
-            return jsonify(
-                {
-                    "success": True,
-                    "result": result_b64,
-                    "shape": result.shape,
-                    "dtype": str(result.dtype),
-                    "batch_size": len(video_batch),
-                }
-            )
-
+             res = global_imagebind_manager.encode_video_segments(request.json["video_batch"])
+             return jsonify({"success": True, "result": base64.b64encode(pickle.dumps(res)).decode()})
         except Exception as e:
-            log_to_file(f"❌ Video encoding API error: {str(e)}")
-            return (
-                jsonify({"success": False, "error": f"Video encoding error: {str(e)}"}),
-                500,
-            )
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    @app.route("/api/imagebind/load", methods=["POST"])
+    def ib_load():
+        try:
+            global_imagebind_manager.ensure_imagebind_loaded()
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
 
     @app.route("/api/imagebind/encode/query", methods=["POST"])
-    def encode_string_query_api():
-        """Encode string query API interface"""
+    def ib_encode_query():
         try:
-            data = request.json
-            query = data.get("query", "").strip()
-
-            if not query:
-                return jsonify({"success": False, "error": "query is required"}), 400
-
-            # Encode query
-            result = get_imagebind_manager().encode_string_query(query).numpy()
-
-            # Convert numpy array to base64 string for transmission
-            result_bytes = pickle.dumps(result)
-            result_b64 = base64.b64encode(result_bytes).decode("utf-8")
-
-            return jsonify(
-                {
-                    "success": True,
-                    "result": result_b64,
-                    "shape": result.shape,
-                    "dtype": str(result.dtype),
-                    "query": query,
-                }
-            )
-
+             res = global_imagebind_manager.encode_string_query(request.json.get("query"))
+             return jsonify({"success": True, "result": base64.b64encode(pickle.dumps(res)).decode()})
         except Exception as e:
-            log_to_file(f"❌ Query encoding API error: {str(e)}")
-            return (
-                jsonify({"success": False, "error": f"Query encoding error: {str(e)}"}),
-                500,
-            )
+            import traceback
+            log_to_file(f"❌ ImageBind Encode Query Failed: {e}\n{traceback.format_exc()}")
+            return jsonify({"success": False, "error": str(e)}), 500
 
-    @app.route("/api/sessions/<chat_id>/videos/upload", methods=["POST"])
-    def upload_video(chat_id):
-        """Upload video for specific chat session and start indexing - asynchronous operation"""
-        log_to_file(f"📝 API: Starting async video upload for chat_id: {chat_id}")
-
-        try:
-            data = request.json
-            video_path_list = data.get("video_path_list", [])
-
-            if not video_path_list:
-                return (
-                    jsonify({"success": False, "error": "video_path_list is required"}),
-                    400,
-                )
-
-            log_to_file(f"📹 Videos to process: {len(video_path_list)}")
-
-            for path in video_path_list:
-                if not path or not os.path.exists(path):
-                    return (
-                        jsonify(
-                            {"success": False, "error": f"Invalid video path: {path}"}
-                        ),
-                        400,
-                    )
-
-            # Get video name list
-            video_names = [
-                os.path.basename(path).split(".")[0] for path in video_path_list
-            ]
-
-            log_to_file(f"🚀 Starting background video processing for {chat_id}")
-
-            # Start background indexing process
-            get_process_manager().start_video_indexing(chat_id, video_path_list)
-
-            # Immediately return success response
-            return jsonify(
-                {
-                    "success": True,
-                    "message": "Video processing started",
-                    "video_names": video_names,
-                    "video_count": len(video_path_list),
-                    "chat_id": chat_id,
-                    "status": "started",
-                }
-            )
-
-        except Exception as e:
-            error_msg = f"Failed to start video processing: {str(e)}"
-            log_to_file(f"❌ {error_msg}")
-            return jsonify({"success": False, "error": error_msg}), 500
-
-    @app.route("/api/sessions/<chat_id>/status", methods=["GET"])
-    def get_indexing_status(chat_id):
-        """Get indexing status for specific session"""
-        try:
-            # Check if this is a query status request
-            query_type = request.args.get("type", "indexing")
-
-            if query_type == "query":
-                # Return query processing status
-                status_info = get_process_manager().get_session_status(chat_id, "query")
-                if not status_info:
-                    return (
-                        jsonify(
-                            {
-                                "success": False,
-                                "error": "Query status not found",
-                                "status": "not_found",
-                            }
-                        ),
-                        404,
-                    )
-
-                log_to_file(f"🔍 Query status: {status_info}")
-
-                return jsonify(
-                    {
-                        "success": True,
-                        "chat_id": chat_id,
-                        "status": status_info.get("status"),
-                        "message": status_info.get("message"),
-                        "current_step": status_info.get("current_step"),
-                        "query": status_info.get("query"),
-                        "answer": status_info.get("answer"),
-                    }
-                )
-            else:
-                # Return indexing status (default)
-                status_info = get_process_manager().get_session_status(
-                    chat_id, "indexing"
-                )
-                if not status_info:
-                    return (
-                        jsonify(
-                            {
-                                "success": False,
-                                "error": "Session not found",
-                                "status": "not_found",
-                            }
-                        ),
-                        404,
-                    )
-
-                log_to_file(f"🔍 Session status: {status_info}")
-
-                return jsonify(
-                    {
-                        "success": True,
-                        "chat_id": chat_id,
-                        "status": status_info.get("status"),
-                        "message": status_info.get("message"),
-                        "current_step": status_info.get("current_step"),
-                    }
-                )
-
-        except Exception as e:
-            log_to_file(f"❌ Session status error: {str(e)}")
-            return (
-                jsonify({"success": False, "error": f"Status check error: {str(e)}"}),
-                500,
-            )
-
-    @app.route("/api/sessions/<chat_id>/videos/indexed", methods=["GET"])
-    def list_indexed_videos(chat_id):
-        """Get list of indexed videos for specific session"""
-        try:
-            indexed_videos = get_process_manager().get_indexed_videos(chat_id)
-
-            return jsonify(
-                {
-                    "success": True,
-                    "indexed_videos": indexed_videos,
-                    "total_count": len(indexed_videos),
-                    "chat_id": chat_id,
-                }
-            )
-
-        except Exception as e:
-            return jsonify({"success": False, "error": f"List error: {str(e)}"}), 500
-
-    @app.route("/api/sessions/<chat_id>/terminate", methods=["POST"])
-    def terminate_session_processes(chat_id):
-        """终止特定session的进程"""
-        try:
-            terminated = get_process_manager().terminate_process(chat_id)
-
-            return jsonify(
-                {
-                    "success": True,
-                    "message": f"Terminated processes for {chat_id}",
-                    "terminated_processes": terminated,
-                }
-            )
-
-        except Exception as e:
-            return (
-                jsonify({"success": False, "error": f"Termination failed: {str(e)}"}),
-                500,
-            )
-
-    @app.route("/api/sessions/<chat_id>/delete", methods=["DELETE"])
-    def delete_session(chat_id):
-        """删除session及其进程"""
-        try:
-            get_process_manager().delete_session(chat_id)
-            return jsonify(
-                {
-                    "success": True,
-                    "message": f"Session {chat_id} deleted successfully",
-                    "chat_id": chat_id,
-                }
-            )
-
-        except Exception as e:
-            return jsonify({"success": False, "error": f"Delete failed: {str(e)}"}), 500
-
-    @app.route("/api/sessions/<chat_id>/query", methods=["POST"])
-    def query_video(chat_id):
-        """Query video content for specific session - start async processing"""
-        try:
-            data = request.json
-            log_to_file(f"🔍 Query data: {data}")
-            if not data:
-                return (
-                    jsonify({"success": False, "error": "No JSON data provided"}),
-                    400,
-                )
-
-            query = data.get("query", "").strip()
-
-            # Start async query processing
-            log_to_file(f"🚀 Starting query processing for chat {chat_id}: {query}")
-            success = get_process_manager().start_query_processing(chat_id, query)
-
-            if not success:
-                return (
-                    jsonify(
-                        {"success": False, "error": "Failed to start query processing"}
-                    ),
-                    500,
-                )
-
-            return jsonify(
-                {
-                    "success": True,
-                    "query": query,
-                    "message": "Query processing started",
-                    "chat_id": chat_id,
-                    "status": "started",
-                }
-            )
-
-        except Exception as e:
-            return jsonify({"success": False, "error": f"Query error: {str(e)}"}), 500
-
-    @app.route("/api/system/status", methods=["GET"])
-    def get_system_status():
-        """Get overall system status"""
-        try:
-            pm = get_process_manager()
-            im = get_imagebind_manager()
-
-            # Calculate active sessions (extract unique chat_id from running processes)
-            active_sessions = set()
-            for key in pm.running_processes.keys():
-                if key.endswith("_query"):
-                    chat_id = key.rsplit("_query", 1)[0]
-                else:
-                    chat_id = key
-                active_sessions.add(chat_id)
-
-            total_sessions = len(active_sessions)
-
-            # Calculate total indexed video count
-            total_videos = 0
-            if pm.global_config:
-                for chat_id in active_sessions:
-                    try:
-                        videos = pm.get_indexed_videos(chat_id)
-                        total_videos += len(videos)
-                    except:
-                        continue
-
-            return jsonify(
-                {
-                    "success": True,
-                    "global_config_set": pm.global_config is not None,
-                    "imagebind_initialized": im.is_initialized,
-                    "imagebind_loaded": im.is_loaded,
-                    "total_sessions": total_sessions,
-                    "total_indexed_videos": total_videos,
-                    "running_processes": pm.get_process_status(),
-                    "sessions": list(active_sessions),
-                }
-            )
-
-        except Exception as e:
-            return (
-                jsonify({"success": False, "error": f"System status error: {str(e)}"}),
-                500,
-            )
-
-    @app.route("/api/sessions", methods=["GET"])
-    def list_all_sessions():
-        """List all sessions (history)"""
-        try:
-            sessions = get_process_manager().get_all_sessions()
-            return jsonify(
-                {
-                    "success": True,
-                    "sessions": sessions,
-                    "count": len(sessions)
-                }
-            )
-        except Exception as e:
-            return jsonify({"success": False, "error": f"List sessions error: {str(e)}"}), 500
-
-    @app.route("/api/system/processes", methods=["GET"])
-    def get_all_processes():
-        """Get all running process status"""
-        try:
-            return jsonify(
-                {
-                    "success": True,
-                    "processes": get_process_manager().get_process_status(),
-                }
-            )
-
-        except Exception as e:
-            return (
-                jsonify({"success": False, "error": f"Process status error: {str(e)}"}),
-                500,
-            )
-
-    # New: ImageBind model management endpoint
-    @app.route("/api/imagebind/load", methods=["POST"])
-    def load_imagebind():
-        """Load ImageBind model"""
-        try:
-            im = get_imagebind_manager()
-            success = im.ensure_imagebind_loaded()
-
-            if success:
-                return jsonify(
-                    {
-                        "success": True,
-                        "message": "ImageBind model loaded successfully",
-                        "status": im.get_status(),
-                    }
-                )
-            else:
-                return (
-                    jsonify(
-                        {"success": False, "error": "Failed to load ImageBind model"}
-                    ),
-                    500,
-                )
-
-        except Exception as e:
-            return (
-                jsonify(
-                    {"success": False, "error": f"Error loading ImageBind: {str(e)}"}
-                ),
-                500,
-            )
-
-    @app.route("/api/imagebind/release", methods=["POST"])
-    def release_imagebind():
-        """Release ImageBind model memory"""
-        try:
-            im = get_imagebind_manager()
-            im.release_imagebind()
-
-            return jsonify(
-                {
-                    "success": True,
-                    "message": "ImageBind model released successfully",
-                    "status": im.get_status(),
-                }
-            )
-
-        except Exception as e:
-            return (
-                jsonify(
-                    {"success": False, "error": f"Error releasing ImageBind: {str(e)}"}
-                ),
-                500,
-            )
-
-    @app.route("/api/imagebind/status", methods=["GET"])
-    def imagebind_status():
-        """Get ImageBind model status"""
-        try:
-            status = get_imagebind_manager().get_status()
-
-            return jsonify(
-                {
-                    "success": True,
-                    "data": {
-                        "loaded": status.get("loaded", False),
-                        "model_type": status.get("model_type"),
-                        "device": status.get("device"),
-                        "memory_usage": status.get("memory_usage"),
-                    },
-                }
-            )
-
-        except Exception as e:
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": f"Error getting ImageBind status: {str(e)}",
-                    }
-                ),
-                500,
-            )
-
-
-def check_port_available(port):
-    """Check if port is available"""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1)
-            result = sock.connect_ex(("localhost", port))
-            return result != 0
-    except Exception:
-        return False
-
-
-def find_available_port(start_port, end_port):
-    """Find an available port within specified range"""
-    for port in range(start_port, end_port + 1):
-        if check_port_available(port):
-            return port
-    return None
-
-
-def get_system_free_port():
-    """Get system-assigned free port (backup solution)"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
-
-
-# Global cleanup flag to avoid repeated cleanup
-_cleanup_called = False
-
-
-def cleanup_on_exit():
-    """Cleanup function when program exits"""
-    global _cleanup_called
-    if _cleanup_called:
-        return
-    _cleanup_called = True
-
-    try:
-        log_to_file("🔔 VideoRAG API server is shutting down...")
-        if process_manager:
-            process_manager.cleanup()
-        if global_imagebind_manager:
-            global_imagebind_manager.cleanup()
-        log_to_file("✅ Cleanup completed")
-    except Exception as e:
-        log_to_file(f"❌ Error during cleanup: {str(e)}")
-
-
-def signal_handler(signum, frame):
-    """Signal handler"""
-    log_to_file(f"🔔 Received signal {signum}, initiating shutdown...")
-    cleanup_on_exit()
-    exit(0)
-
+    return app
 
 if __name__ == "__main__":
-    # Must call freeze_support() at the beginning to support multiprocessing after packaging
-    multiprocessing.freeze_support()
-
-    # Register cleanup function and signal handler
-    atexit.register(cleanup_on_exit)
-    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
-
-    # Windows special handling
-    if os.name == "nt":  # Windows
-        try:
-            import win32api
-
-            def win32_handler(dwCtrlType):
-                log_to_file(f"🔔 Windows signal received: {dwCtrlType}")
-                cleanup_on_exit()
-                return True
-
-            win32api.SetConsoleCtrlHandler(win32_handler, True)
-        except ImportError:
-            log_to_file("⚠️ win32api not available, using basic signal handling")
-            pass
-
-    # Set process name only in main process
-    try:
-        import setproctitle
-
-        setproctitle.setproctitle("videorag-api-server")
-    except ImportError:
-        import sys
-
-        if hasattr(sys, "argv"):
-            sys.argv[0] = "videorag-api-server"
-
-    # Port configuration - centralized in main
-    DEFAULT_PORT = 64451
-    PORT_RANGE_START = 64451
-    PORT_RANGE_END = 64470
-
-    # Note: Do not initialize manager instance here directly, but use get_ function for delayed initialization
-
-    try:
-        SERVER_PORT = None
-
-        if check_port_available(DEFAULT_PORT):
-            SERVER_PORT = DEFAULT_PORT
-        else:
-            SERVER_PORT = find_available_port(PORT_RANGE_START, PORT_RANGE_END)
-            if not SERVER_PORT:
-                SERVER_PORT = get_system_free_port()
-
-        # Set port as global variable for other functions
-        globals()["SERVER_PORT"] = SERVER_PORT
-
-        # Now it is safe to set multiprocessing start method
-        multiprocessing.set_start_method("spawn")
-
-        log_to_file(
-            f"🚀 Starting VideoRAG API with global ImageBind on port {SERVER_PORT}"
-        )
-        log_to_file(f"📝 Main process PID: {os.getpid()}")
-
-        # Auto-initialize configuration
-        success, msg = load_and_init_global_config()
-        if success:
-            log_to_file(f"✅ Auto-initialization successful: {msg}")
-        else:
-            log_to_file(f"⚠️ Auto-initialization failed: {msg}")
-
-        # Use factory function to create Flask app
-        app = create_app()
-        app.run(host="0.0.0.0", port=SERVER_PORT, debug=False, threaded=True)
-
-    except KeyboardInterrupt:
-        log_to_file("🔔 Received keyboard interrupt")
-        cleanup_on_exit()
-    except Exception as e:
-        log_to_file(f"❌ Failed to start server: {e}")
-        cleanup_on_exit()
-        exit(1)
-    finally:
-        cleanup_on_exit()
+    app = create_app()
+    port = int(os.environ.get("PORT", 64451))
+    globals()['SERVER_PORT'] = port 
+    app.run(host="0.0.0.0", port=port, threaded=True)

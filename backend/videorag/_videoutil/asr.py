@@ -9,6 +9,18 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
     """
     Process a single audio segment with ASR
     """
+    # Check for cached transcript
+    txt_file = os.path.splitext(audio_file)[0] + ".txt"
+    if os.path.exists(txt_file):
+        try:
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if content.strip():
+                logger.info(f"Using cached transcript for {segment_name}")
+                return index, content.strip()
+        except Exception:
+            pass # Fallback to processing
+
     async with semaphore:  # Limit concurrent requests
         try:
             logger.info(f"Processing segment {segment_name} with model {model}")
@@ -32,6 +44,14 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
                 asr_result = ""
                 for sentence in sentences:
                     asr_result += sentence.get('text', '') + "\n"
+                
+                # Cache the result
+                try:
+                    with open(txt_file, 'w', encoding='utf-8') as f:
+                        f.write(asr_result)
+                except Exception as e:
+                    logger.warning(f"Failed to cache transcript: {e}")
+
                 return index, asr_result.strip()
             else:
                 logger.warning(f"No transcription result for segment {segment_name}")
