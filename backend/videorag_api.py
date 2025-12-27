@@ -570,6 +570,69 @@ class VideoRAGProcessManager:
             }
         return status
 
+    def get_all_sessions(self):
+        """Get all sessions history (both active and inactive)"""
+        if not self.global_config:
+            return []
+
+        try:
+            base_storage_path = self.global_config.get("base_storage_path")
+            sessions = []
+
+            if not os.path.exists(base_storage_path):
+                return []
+
+            # Scan directory
+            for entry in os.scandir(base_storage_path):
+                if entry.is_dir() and entry.name.startswith("chat-"):
+                    chat_id = entry.name[5:]  # Remove "chat-" prefix
+                    status_file = os.path.join(entry.path, "status.json")
+                    
+                    session_info = {
+                        "chat_id": chat_id,
+                        "created_at": entry.stat().st_ctime,
+                        "last_updated": entry.stat().st_mtime,
+                        "status": "unknown",
+                        "video_count": 0
+                    }
+
+                    # Try to read status file
+                    if os.path.exists(status_file):
+                        try:
+                            status_data = read_status_json(status_file)
+                            
+                            # Determine status
+                            indexing_status = status_data.get("indexing_status", {})
+                            if indexing_status.get("status") == "processing":
+                                session_info["status"] = "indexing"
+                            else:
+                                session_info["status"] = "ready"
+
+                            # Get video count
+                            indexed_videos = status_data.get("indexed_videos", [])
+                            session_info["video_count"] = len(indexed_videos)
+                            
+                            # Get last updated from file if available
+                            if "last_updated" in status_data:
+                                session_info["last_updated"] = status_data["last_updated"]
+                                
+                        except Exception:
+                            pass
+                            
+                    # Check if currently active in memory
+                    if chat_id in self.running_processes:
+                         session_info["status"] = "active_process"
+
+                    sessions.append(session_info)
+
+            # Sort by last updated desc
+            sessions.sort(key=lambda x: x["last_updated"], reverse=True)
+            return sessions
+
+        except Exception as e:
+            log_to_file(f"❌ Failed to get all sessions: {str(e)}")
+            return []
+
     def cleanup(self):
         """Clean up resources - force terminate all subprocesses"""
         log_to_file("🧹 Starting process cleanup...")
@@ -704,13 +767,42 @@ def index_video_worker_process(chat_id, video_path_list, global_config, server_u
         # Create HTTP ImageBind client
         imagebind_client = HTTPImageBindClient(server_url)
 
-        # Verify ImageBind service availability
+        # Verify ImageBind service availability and ensure loaded
         try:
-            status = imagebind_client.get_status()
-            if not status["initialized"]:
-                raise RuntimeError("ImageBind not initialized in main process")
+            max_retries = 30
+            retry_interval = 2
+            
+            for i in range(max_retries):
+                try:
+                    status = imagebind_client.get_status()
+                    
+                    if not status.get("initialized"):
+                        raise RuntimeError("ImageBind not initialized in main process")
+                        
+                    if status.get("loaded"):
+                        log_to_file("✅ ImageBind is loaded and ready")
+                        break
+                    
+                    if i == 0:
+                        log_to_file("⚠️ ImageBind not loaded, triggering auto-load...")
+                        # Trigger load
+                        try:
+                            requests.post(f"{server_url}/api/imagebind/load", timeout=5)
+                        except Exception as e:
+                            log_to_file(f"⚠️ Trigger load warning: {e}")
+                            
+                    log_to_file(f"⏳ Waiting for ImageBind to load... ({i+1}/{max_retries})")
+                    time.sleep(retry_interval)
+                    
+                except Exception as e:
+                    if i == max_retries - 1:
+                        raise e
+                    time.sleep(retry_interval)
+            else:
+                 raise RuntimeError("Timeout waiting for ImageBind to load")
+
         except Exception as e:
-            raise RuntimeError(f"Failed to connect to ImageBind service: {str(e)}")
+            raise RuntimeError(f"Failed to connect/load ImageBind service: {str(e)}")
 
         # Create VideoRAG instance
         session_working_dir = os.path.join(base_storage_path, f"chat-{chat_id}")
@@ -1409,6 +1501,21 @@ def register_routes(app):
                 jsonify({"success": False, "error": f"System status error: {str(e)}"}),
                 500,
             )
+
+    @app.route("/api/sessions", methods=["GET"])
+    def list_all_sessions():
+        """List all sessions (history)"""
+        try:
+            sessions = get_process_manager().get_all_sessions()
+            return jsonify(
+                {
+                    "success": True,
+                    "sessions": sessions,
+                    "count": len(sessions)
+                }
+            )
+        except Exception as e:
+            return jsonify({"success": False, "error": f"List sessions error: {str(e)}"}), 500
 
     @app.route("/api/system/processes", methods=["GET"])
     def get_all_processes():

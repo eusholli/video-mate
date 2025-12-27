@@ -49,12 +49,24 @@ export const api = {
     async loadImageBind(): Promise<any> {
         return this.post("/api/imagebind/load", {});
     },
+
+    async getSessions(): Promise<{ success: boolean; sessions: Session[]; count: number }> {
+        return this.get("/api/sessions");
+    },
 };
+
+export interface Session {
+    chat_id: string;
+    created_at: number;
+    last_updated: number;
+    status: "indexing" | "ready" | "active_process" | "unknown";
+    video_count: number;
+}
 
 export interface SystemStatus {
     success: boolean;
     total_sessions: number;
     imagebind_loaded: boolean;
-    sessions: string[];
+    sessions: string[]; // This is the old list of active session IDs
     global_config_set?: boolean;
 }
