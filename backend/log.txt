@@ -1,0 +1,16 @@
+[2025-12-27 12:24:34] 🚀 Starting VideoRAG API with global ImageBind on port 64451
+[2025-12-27 12:24:34] 📝 Main process PID: 59302
+[2025-12-27 12:24:34] 🔄 Global config set.
+[2025-12-27 12:24:34] ✅ ImageBind manager configured with model path: ds/models/imagebind_huge.pth
+[2025-12-27 12:24:34] 🚀 Auto-loading ImageBind model...
+[2025-12-27 12:24:34] 🔄 Loading ImageBind model...
+[2025-12-27 12:24:34] 📍 Using device for ImageBind: cpu
+[2025-12-27 12:24:40] ✅ ImageBind model loaded successfully
+[2025-12-27 12:24:40] ✅ Auto-initialization successful: VideoRAG system configuration set successfully from environment variables
+[2025-12-27 12:25:13] 🔔 Received signal 2, initiating shutdown...
+[2025-12-27 12:25:13] 🔔 VideoRAG API server is shutting down...
+[2025-12-27 12:25:13] 🧹 Starting process cleanup...
+[2025-12-27 12:25:15] 🧹 Process manager cleanup completed
+[2025-12-27 12:25:15] 🧹 ImageBind model released successfully
+[2025-12-27 12:25:15] 🧹 ImageBind manager cleaned up
+[2025-12-27 12:25:15] ✅ Cleanup completed
