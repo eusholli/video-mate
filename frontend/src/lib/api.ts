@@ -109,6 +109,8 @@ export interface VideoEntry {
     original_path: string;
     status: "processing" | "ready" | "error";
     error?: string;
+    progress?: number;
+    phase?: string;
     created_at: number;
     updated_at: number;
 }

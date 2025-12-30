@@ -31,7 +31,7 @@ export function LibraryList() {
         // Poll for updates while any video is processing
         const interval = setInterval(() => {
             fetchLibrary();
-        }, 5000);
+        }, 2000);
         return () => clearInterval(interval);
     }, []);
 
@@ -112,23 +112,41 @@ export function LibraryList() {
                         <div className="text-center text-sm text-muted-foreground p-4">Library is empty.</div>
                     )}
                     {videos.map(v => (
-                        <div key={v.id} className="flex items-center justify-between p-3 border rounded hover:bg-muted/50">
-                            <div className="overflow-hidden">
-                                <div className="font-medium truncate" title={v.title}>{v.title}</div>
-                                <div className="text-xs text-muted-foreground flex gap-2">
-                                    <span>{v.status}</span>
-                                    <span>• {formatDistanceToNow(v.updated_at * 1000)} ago</span>
+                        <div key={v.id} className="flex flex-col p-3 border rounded hover:bg-muted/50 gap-2">
+                            <div className="flex items-center justify-between">
+                                <div className="overflow-hidden">
+                                    <div className="font-medium truncate" title={v.title}>{v.title}</div>
+                                    <div className="text-xs text-muted-foreground flex gap-2">
+                                        <span>{v.status}</span>
+                                        <span>• {formatDistanceToNow(v.updated_at * 1000)} ago</span>
+                                    </div>
+                                    {v.error && <div className="text-xs text-red-500 truncate" title={v.error}>{v.error}</div>}
                                 </div>
-                                {v.error && <div className="text-xs text-red-500 truncate" title={v.error}>{v.error}</div>}
+                                <div className="flex items-center gap-2">
+                                    {v.status === "error" || v.status === "processing" ? (
+                                        <Button variant="outline" size="sm" onClick={() => handleIngestPath(v.original_path)}>
+                                            {v.status === "processing" ? "Check" : "Resume"}
+                                        </Button>
+                                    ) : null}
+                                    <Button variant="secondary" size="sm" className="text-red-500 hover:text-red-700 hover:bg-red-50" onClick={() => handleDelete(v.id)}>X</Button>
+                                </div>
                             </div>
-                            <div className="flex items-center gap-2">
-                                {v.status === "error" || v.status === "processing" ? (
-                                    <Button variant="outline" size="sm" onClick={() => handleIngestPath(v.original_path)}>
-                                        {v.status === "processing" ? "Check" : "Resume"}
-                                    </Button>
-                                ) : null}
-                                <Button variant="secondary" size="sm" className="text-red-500 hover:text-red-700 hover:bg-red-50" onClick={() => handleDelete(v.id)}>X</Button>
-                            </div>
+
+                            {/* Progress Bar for Processing */}
+                            {v.status === "processing" && (
+                                <div className="w-full space-y-1">
+                                    <div className="flex justify-between text-xs text-muted-foreground">
+                                        <span>{v.phase || "Processing..."}</span>
+                                        <span>{v.progress || 0}%</span>
+                                    </div>
+                                    <div className="h-2 w-full bg-secondary rounded-full overflow-hidden">
+                                        <div
+                                            className="h-full bg-primary transition-all duration-500 ease-in-out"
+                                            style={{ width: `${v.progress || 0}%` }}
+                                        />
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     ))}
                 </div>
@@ -136,3 +154,7 @@ export function LibraryList() {
         </Card>
     );
 }
+
+// Update interval for smoother progress
+// In useEffect: 5000 -> 2000
+

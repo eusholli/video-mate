@@ -1,0 +1,15 @@
+
+> video-mate-web@0.1.0 dev
+> next dev
+
+▲ Next.js 16.1.1 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.1.197:3000
+- Experiments (use with caution):
+  · serverActions
+
+✓ Starting...
+✓ Ready in 368ms
+ GET / 200 in 416ms (compile: 333ms, render: 83ms)
+ GET / 200 in 29ms (compile: 4ms, render: 25ms)
+[?25h

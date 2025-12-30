@@ -236,6 +236,8 @@ class LibraryManager:
             "title": title,
             "original_path": original_path,
             "status": "processing",
+            "progress": 0,
+            "phase": "Initializing",
             "created_at": time.time(),
             "updated_at": time.time()
         }
@@ -243,12 +245,14 @@ class LibraryManager:
         save_json_file(self.library_json, videos)
         return new_entry
 
-    def update_status(self, video_id, status, error=None):
+    def update_status(self, video_id, status, error=None, progress=None, phase=None):
         videos = self.list_videos()
         for v in videos:
             if v["id"] == video_id:
                 v["status"] = status
                 if error: v["error"] = error
+                if progress is not None: v["progress"] = progress
+                if phase: v["phase"] = phase
                 v["updated_at"] = time.time()
                 save_json_file(self.library_json, videos)
                 return
@@ -353,10 +357,17 @@ def ingest_worker_process(video_id, file_path, global_config, server_url, resume
         os.makedirs(working_dir, exist_ok=True)
         
         # Status callback
-        def progress_callback(step, msg):
-             # We could update a detailed status file in working_dir if needed
-             # For now, we rely on 'status.json' managed by split/resume logic
-             log_to_file(f"[{video_id}] {step}: {msg}")
+        def progress_callback(percent, step, msg):
+             log_to_file(f"[{video_id}] {percent}% {step}: {msg}")
+             try:
+                 # Update status in library.json
+                 # Re-instantiate lib_mgr inside callback to ensure freshness?
+                 # Or just use the one we have? Usage is safe if we don't hold big state.
+                 # But we need to use a fresh instance or method that reads/writes atomically.
+                 # LibraryManager.update_status re-reads the file every time.
+                 lib_mgr.update_status(video_id, "processing", progress=percent, phase=step)
+             except Exception as e:
+                 log_to_file(f"Failed to update progress for {video_id}: {e}")
 
         # Setup VideoRAG
         imagebind_client = HTTPImageBindClient(server_url)
@@ -413,7 +424,7 @@ def ingest_worker_process(video_id, file_path, global_config, server_url, resume
             resume=resume
         )
         
-        lib_mgr.update_status(video_id, "ready")
+        lib_mgr.update_status(video_id, "ready", progress=100, phase="Ready")
         log_to_file(f"✅ Ingestion complete for {video_id}")
         
     except Exception as e:

@@ -301,7 +301,7 @@ class VideoRAG:
         
         Args:
             video_path_list: 视频文件路径列表
-            progress_callback: 进度回调函数，接收 (step_name, message) 参数
+            progress_callback: 进度回调函数，接收 (percent, step_name, message) 参数
             resume: Whether to resume from previous checkpoint (files)
         """
         if video_path_list is None:
@@ -320,9 +320,9 @@ class VideoRAG:
                 {video_name: video_path}
             ))
             
-            # Step1: split the videos
+            # Step1: split the videos - 10%
             if progress_callback:
-                progress_callback("Video Splitting", f"Splitting video into clips for {video_name}...")
+                progress_callback(10, "Video Splitting", f"Splitting video into clips for {video_name}...")
             
             segment_index2name, segment_times_info = split_video(
                 video_path, 
@@ -334,9 +334,9 @@ class VideoRAG:
                 resume=resume,
             )
             
-            # Step2: obtain transcript with ASR (online)
+            # Step2: obtain transcript with ASR (online) - 20%
             if progress_callback:
-                progress_callback("Audio Processing", f"Performing speech recognition for {video_name}...")
+                progress_callback(20, "Audio Processing", f"Performing speech recognition for {video_name}...")
             
             transcripts = speech_to_text(
                 video_name, 
@@ -346,9 +346,9 @@ class VideoRAG:
                 self.safe_config,  # Pass global config dict
             )
             
-            # Step3: saving video segments **as well as** obtain caption with vision language model
+            # Step3: saving video segments **as well as** obtain caption with vision language model - 40%
             if progress_callback:
-                progress_callback("Visual Analyzing", f"Analyzing video content for {video_name}...")
+                progress_callback(40, "Visual Analyzing", f"Analyzing video content for {video_name}...")
             
     
             saving_video_segments(
@@ -384,9 +384,9 @@ class VideoRAG:
                 {video_name: segments_information}
             ))
             
-            # Step4: encode video segment features
+            # Step4: encode video segment features - 70%
             if progress_callback:
-                progress_callback("Feature Encoding", f"Encoding video features for {video_name}...")
+                progress_callback(70, "Feature Encoding", f"Encoding video features for {video_name}...")
             
             loop.run_until_complete(self.video_segment_feature_vdb.upsert(
                 video_name,
@@ -398,19 +398,19 @@ class VideoRAG:
             if os.path.exists(video_segment_cache_path):
                 shutil.rmtree(video_segment_cache_path)
             
-            # Step 5: saving current video information
+            # Step 5: saving current video information - 80%
             if progress_callback:
-                progress_callback("Saving Video Information", f"Saving video information for {video_name}...")
+                progress_callback(80, "Saving Video Information", f"Saving video information for {video_name}...")
             loop.run_until_complete(self._save_video_segments())
 
         if progress_callback:
-            progress_callback("Creating Knowledge Graph", f"Creating knowledge graph for all videos...")
+            progress_callback(90, "Creating Knowledge Graph", f"Creating knowledge graph for all videos...")
         # start graph-based indexing
         loop.run_until_complete(self.ainsert(self.video_segments._data))
         
-        # 🔄 Progress: 完成
+        # 🔄 Progress: 完成 - 100%
         if progress_callback:
-            progress_callback("Completed", f"Video processing completed for all videos")
+            progress_callback(100, "Completed", f"Video processing completed for all videos")
 
     def query(self, query: str, param: QueryParam = QueryParam()):
         loop = always_get_an_event_loop()
