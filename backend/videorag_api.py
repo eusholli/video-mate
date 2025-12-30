@@ -633,6 +633,18 @@ def query_worker_process(session_id, query, global_config, server_url):
             caption_model_max_async=3,
         )
         
+        # Collect Video Titles for display
+        def clean_title(v):
+            original = v.get("title", os.path.basename(v.get("original_path", "Unknown")))
+            # Try to strip "1234567890_" prefix if present
+            import re
+            match = re.match(r'^\d+_(.*)$', original)
+            if match:
+                return match.group(1)
+            return original
+
+        video_titles = {v["id"]: clean_title(v) for v in lib_mgr.list_videos()}
+
         rag = VideoRAG(
             llm=videorag_llm_config,
             working_dir=session_dir, # Points to Unified Data
@@ -643,7 +655,7 @@ def query_worker_process(session_id, query, global_config, server_url):
             openai_api_key=global_config.get("openai_api_key"),
             openai_base_url=global_config.get("openai_base_url"),
             imagebind_client=imagebind_client,
-            addon_params={"server_url": server_url},
+            addon_params={"server_url": server_url, "video_titles": video_titles},
         )
         
         

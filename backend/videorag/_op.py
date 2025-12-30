@@ -833,17 +833,22 @@ async def videorag_query(
                 merged_clips.append(current_clip)
             
             # 4. Generate Links
+            # Get video titles from addon_params
+            video_titles = global_config.get("addon_params", {}).get("video_titles", {})
+            
             for clip in merged_clips:
                 def fmt_time(t): return f"{int(t)//60:02d}:{int(t)%60:02d}"
                 display_time = f"{fmt_time(clip['start'])} - {fmt_time(clip['end'])}"
                 
                 link = f"{server_url}/api/library/videos/{clip['video_id']}/file#t={clip['start']},{clip['end']}"
                 
-                # Clean caption
-                long_cap = clip['caption']
-                clean_cap = long_cap.split('\n')[0][:150] + "..." if len(long_cap) > 150 else long_cap.split('\n')[0]
+                # Get Title
+                title = video_titles.get(clip['video_id'], "Unknown Video")
                 
-                response += f"* [{display_time}]({link}): {clean_cap}\n"
+                # Clean caption - Remove "(Transcript Match) Transcript:" (handling newlines) and extra newlines
+                clean_cap = clip['caption'].replace('(Transcript Match)\nTranscript:', '').replace('(Transcript Match) Transcript:', '').replace('Caption:\n', '').replace('Caption: ', '').replace('\n', ' ').strip()
+                
+                response += f"* **{title}** [{display_time}]({link}): {clean_cap}\n"
     except Exception as e:
         logger.warning(f"Failed to append clips: {e}")
         import traceback

@@ -29,7 +29,7 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
                 model=model,
                 format=audio_output_format,
                 sample_rate=sample_rate,
-                language_hints=['zh', 'en', 'ja'],
+                language_hints=['en'],
                 callback=None  # type: ignore  # SDK type annotation issue
             )
             
