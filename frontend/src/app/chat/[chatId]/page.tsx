@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { formatDistanceToNow } from "date-fns";
+import ReactMarkdown from "react-markdown";
 
 type Message = {
     role: "user" | "assistant";
@@ -141,12 +142,14 @@ export default function ChatPage() {
                 {messages.map((msg, idx) => (
                     <div key={idx} className={cn("flex w-full", msg.role === "user" ? "justify-end" : "justify-start")}>
                         <div className={cn(
-                            "max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-sm whitespace-pre-wrap",
+                            "max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-sm",
                             msg.role === "user"
                                 ? "bg-primary text-primary-foreground rounded-tr-none"
                                 : "bg-muted text-foreground rounded-tl-none border"
                         )}>
-                            {msg.content}
+                            <div className="prose prose-sm dark:prose-invert max-w-none">
+                                <ReactMarkdown>{msg.content}</ReactMarkdown>
+                            </div>
                         </div>
                     </div>
                 ))}
