@@ -23,12 +23,7 @@ export function Header() {
                         >
                             Dashboard
                         </Link>
-                        <Link
-                            href="/ingest"
-                            className={cn("transition-colors hover:text-foreground/80", pathname === "/ingest" ? "text-foreground" : "text-foreground/60")}
-                        >
-                            Ingest
-                        </Link>
+
                     </nav>
                 </div>
 
