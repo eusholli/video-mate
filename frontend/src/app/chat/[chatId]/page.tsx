@@ -144,10 +144,10 @@ export default function ChatPage() {
                         <div className={cn(
                             "max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-sm",
                             msg.role === "user"
-                                ? "bg-primary text-gray-900 font-medium rounded-tr-none"
+                                ? "bg-primary text-primary-foreground font-medium rounded-tr-none"
                                 : "bg-muted text-foreground rounded-tl-none border"
                         )}>
-                            <div className={cn("prose prose-sm max-w-none", msg.role === "user" ? "text-gray-900 [&_p]:text-gray-900" : "dark:prose-invert")}>
+                            <div className={cn("prose prose-sm max-w-none", msg.role === "user" ? "text-primary-foreground [&_p]:text-primary-foreground" : "dark:prose-invert")}>
                                 <ReactMarkdown>{msg.content}</ReactMarkdown>
                             </div>
                         </div>
