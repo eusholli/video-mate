@@ -5,18 +5,20 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { uploadFile } from "./actions";
+
 import { api } from "@/lib/api";
 
 export default function IngestPage() {
     const router = useRouter();
     const [file, setFile] = useState<File | null>(null);
     const [uploading, setUploading] = useState(false);
+    const [progress, setProgress] = useState<string>("");
     const [error, setError] = useState<string | null>(null);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files.length > 0) {
             setFile(e.target.files[0]);
+            setError(null);
         }
     };
 
@@ -27,33 +29,38 @@ export default function IngestPage() {
         }
         setUploading(true);
         setError(null);
+        setProgress("Uploading file...");
 
         try {
-            // 1. Upload file to Next.js server to get local path
-            const formData = new FormData();
-            formData.append("file", file);
-            const { path } = await uploadFile(formData);
+            // 1. Upload file using standard API
+            const uploadRes = await api.uploadFile(file);
+            if (!uploadRes.success) throw new Error("Upload failed");
 
-            // 2. Generate Chat ID
-            const chatId = crypto.randomUUID();
+            setProgress("Starting ingestion...");
 
-            // 3. Call Python Backend to start indexing
-            // Note: Backend expects list of paths
-            const response = await api.post<any>(`/api/sessions/${chatId}/videos/upload`, {
-                video_path_list: [path],
-            });
+            // 2. Start Ingestion
+            const ingestRes = await api.ingestVideo(uploadRes.path);
+            if (!ingestRes.success) throw new Error(ingestRes.message || "Ingestion failed to start");
 
-            if (response.success) {
+            const videoId = ingestRes.video_id;
+            if (!videoId) throw new Error("No Video ID returned from ingestion");
+
+            setProgress("Creating session...");
+
+            // 3. Create Session immediately
+            // We use the filename as the default session name
+            const sessionRes = await api.createSession(file.name, [videoId]);
+
+            if (sessionRes.success) {
                 // Redirect to Chat page
-                router.push(`/chat/${chatId}`);
+                router.push(`/chat/${sessionRes.session.id}`);
             } else {
-                throw new Error(response.error || "Failed to start processing");
+                throw new Error("Failed to create session");
             }
 
         } catch (err: any) {
             console.error(err);
             setError(err.message || "An unexpected error occurred.");
-        } finally {
             setUploading(false);
         }
     };
@@ -63,7 +70,7 @@ export default function IngestPage() {
             <Card className="w-full max-w-lg">
                 <CardHeader>
                     <CardTitle>Upload Video</CardTitle>
-                    <CardDescription>Select a video to ingest into your knowledge base.</CardDescription>
+                    <CardDescription>Select a video to ingest and start chatting.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
                     <div className="grid w-full items-center gap-4">
@@ -73,9 +80,11 @@ export default function IngestPage() {
                                 accept="video/*"
                                 onChange={handleFileChange}
                                 className="cursor-pointer file:cursor-pointer file:text-primary file:font-semibold hover:file:bg-primary/10"
+                                disabled={uploading}
                             />
                         </div>
                         {error && <p className="text-sm text-destructive">{error}</p>}
+                        {uploading && <p className="text-sm text-muted-foreground animate-pulse">{progress}</p>}
                     </div>
 
                     <Button
@@ -86,7 +95,7 @@ export default function IngestPage() {
                         {uploading ? "Processing..." : "Start Ingestion"}
                     </Button>
 
-                    <Button variant="ghost" className="w-full" onClick={() => router.push('/')}>
+                    <Button variant="ghost" className="w-full" onClick={() => router.push('/')} disabled={uploading}>
                         Back to Dashboard
                     </Button>
                 </CardContent>
