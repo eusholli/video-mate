@@ -787,6 +787,9 @@ async def videorag_query(
             response += "\n\n### Relevant Clips\n"
             server_url = global_config.get("addon_params", {}).get("server_url", "http://localhost:64451")
             
+            # Create Score Lookup
+            score_map = {seg['id']: seg.get('score', 0.0) for seg in remain_segments}
+
             # 1. Parse into structured objects
             clips = []
             for s_id, caption in caption_results.items():
@@ -809,7 +812,8 @@ async def videorag_query(
                     "start": start_sec,
                     "end": end_sec,
                     "caption": caption,
-                    "s_id": s_id
+                    "s_id": s_id,
+                    "score": score_map.get(s_id, 0.0)
                 })
             
             # 2. Sort
@@ -825,12 +829,16 @@ async def videorag_query(
                         # Merge
                         current_clip["end"] = next_clip["end"]
                         current_clip["caption"] += " " + next_clip["caption"]
+                        current_clip["score"] = max(current_clip["score"], next_clip["score"])
                         # Update index to maintain continuity for subsequent checks
                         current_clip["index"] = next_clip["index"] 
                     else:
                         merged_clips.append(current_clip)
                         current_clip = next_clip
                 merged_clips.append(current_clip)
+
+            # Sort by Relevancy Score (Descending)
+            merged_clips.sort(key=lambda x: x["score"], reverse=True)
             
             # 4. Generate Links
             # Get video titles from addon_params
