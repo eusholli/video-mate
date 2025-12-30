@@ -602,6 +602,19 @@ async def videorag_query(
     section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
     retreived_chunk_context = section
     
+    # [Refactor] Gather text segments with metadata
+    logger.info(f"DEBUG: Checking {len(maybe_trun_chunks)} text chunks for video_segment_id")
+    if len(maybe_trun_chunks) > 0:
+        logger.info(f"DEBUG: Sample Chunk Keys: {maybe_trun_chunks[0].keys()}")
+        logger.info(f"DEBUG: Sample Chunk Content: {maybe_trun_chunks[0]}")
+
+    text_segment_objects = []
+    for c in maybe_trun_chunks:
+        if "video_segment_id" in c:
+            for s_id in c["video_segment_id"]:
+                # Text matches are high confidence. Assign score 1.0 (or higher?)
+                text_segment_objects.append({"id": s_id, "type": "text", "score": 10.0})
+    
     # visual retrieval
     query_for_entity_retrieval = await _refine_entity_retrieval_query(
         query,
@@ -609,7 +622,9 @@ async def videorag_query(
         global_config,
     )
     entity_results = await entities_vdb.query(query_for_entity_retrieval, top_k=query_param.top_k)
+    entity_results = await entities_vdb.query(query_for_entity_retrieval, top_k=query_param.top_k)
     entity_retrieved_segments = set()
+    entity_retrieved_objects = []
     if len(entity_results):
         node_datas = await asyncio.gather(
             *[knowledge_graph_inst.get_node(r["entity_name"]) for r in entity_results]
@@ -624,9 +639,11 @@ async def videorag_query(
             for k, n, d in zip(entity_results, node_datas, node_degrees)
             if n is not None
         ]
-        entity_retrieved_segments = entity_retrieved_segments.union(await _find_most_related_segments_from_entities(
+        entity_retrieved_ids = entity_retrieved_segments.union(await _find_most_related_segments_from_entities(
             global_config["retrieval_topk_chunks"], node_datas, text_chunks_db, knowledge_graph_inst
         ))
+        for eid in entity_retrieved_ids:
+             entity_retrieved_objects.append({"id": eid, "type": "entity", "score": 2.0}) # Medium priority
     
     # visual retrieval
     query_for_visual_retrieval = await _refine_visual_retrieval_query(
@@ -635,24 +652,44 @@ async def videorag_query(
         global_config,
     )
     segment_results = await video_segment_feature_vdb.query(query_for_visual_retrieval)
-    visual_retrieved_segments = set()
+    visual_retrieved_objects = []
     if len(segment_results):
         for n in segment_results:
-            visual_retrieved_segments.add(n['__id__'])
+            # Capture actual distance from vector DB
+            visual_retrieved_objects.append({"id": n['__id__'], "type": "visual", "score": n.get('distance', 0.0)})
     
     # caption
-    retrieved_segments = list(entity_retrieved_segments.union(visual_retrieved_segments))
-    retrieved_segments = sorted(
-        retrieved_segments,
-        key=lambda x: (
-            '_'.join(x.split('_')[:-1]), # video_name
-            eval(x.split('_')[-1]) # index
-        )
-    )
+    # Consolidate all objects
+    all_retrieved_objects = text_segment_objects + entity_retrieved_objects + visual_retrieved_objects
+    
+    # Deduplicate by ID, keeping highest score/priority
+    unique_segments = {}
+    for obj in all_retrieved_objects:
+        sid = obj["id"]
+        if sid not in unique_segments:
+            unique_segments[sid] = obj
+        else:
+            # [Fix] Visual Priority: If current or new is visual, keep/make it visual.
+            # This ensures we don't downgrade a visual match to a text match
+            # which would skip the visual captioning path.
+            existing = unique_segments[sid]
+            
+            # If the NEW object is visual, it should upgrade the existing one
+            if obj["type"] == "visual":
+                unique_segments[sid] = obj
+            # If both are same type (or new is not visual), keep highest score
+            elif obj["type"] == existing["type"] and obj["score"] > existing["score"]:
+                unique_segments[sid] = obj
+                
+    retrieved_segments = list(unique_segments.values())
+    # No sorting here, passing full objects to caption function
+    
     logger.info(query_for_entity_retrieval)
-    logger.info(f"Retrieved Text Segments {entity_retrieved_segments}")
+    logger.info(f"Retrieved Segments Count: {len(retrieved_segments)}")
+    logger.info(query_for_entity_retrieval)
+    logger.info(f"Retrieved Entity Objects: {len(entity_retrieved_objects)}")
     logger.info(query_for_visual_retrieval)
-    logger.info(f"Retrieved Visual Segments {visual_retrieved_segments}")
+    logger.info(f"Retrieved Visual Objects: {len(visual_retrieved_objects)}")
     
     already_processed = 0
     async def _filter_single_segment(knowledge: str, segment_key_dp: tuple[str, str]):
@@ -670,19 +707,33 @@ async def videorag_query(
         return (segment_key, result)
     
     rough_captions = {}
-    for s_id in retrieved_segments:
+    for seg_obj in retrieved_segments:
+        s_id = seg_obj["id"]
         video_name = '_'.join(s_id.split('_')[:-1])
         index = s_id.split('_')[-1]
         rough_captions[s_id] = video_segments._data[video_name][index]["content"]
     results = await asyncio.gather(
         *[_filter_single_segment(query, (s_id, rough_captions[s_id])) for s_id in rough_captions]
     )
-    remain_segments = [x[0] for x in results if 'yes' in x[1].lower()]
+    # [Fix] Preserve metadata (type/score) by mapping IDs back to objects
+    remain_segment_ids = [x[0] for x in results if 'yes' in x[1].lower()]
+    
+    # Create lookup map
+    id_to_obj = {seg["id"]: seg for seg in retrieved_segments}
+    
+    remain_segments = []
+    for rid in remain_segment_ids:
+        if rid in id_to_obj:
+            remain_segments.append(id_to_obj[rid])
+            
     logger.info(f"{len(remain_segments)} Video Segments remain after filtering")
+    
     if len(remain_segments) == 0:
         logger.info("Since no segments remain after filtering, we utilized all the retrieved segments.")
+        # Stick to objects if possible
         remain_segments = retrieved_segments
-    logger.info(f"Remain segments {remain_segments}")
+        
+    logger.info(f"Remain segments objects count: {len(remain_segments)}")
     
     # visual retrieval
     keywords_for_caption = await _extract_keywords_query(
@@ -729,6 +780,75 @@ async def videorag_query(
         system_prompt=sys_prompt,
         global_config=global_config,
     )
+    
+    # --- Append Relevant Clips ---
+    try:
+        if caption_results:
+            response += "\n\n### Relevant Clips\n"
+            server_url = global_config.get("addon_params", {}).get("server_url", "http://localhost:64451")
+            
+            # 1. Parse into structured objects
+            clips = []
+            for s_id, caption in caption_results.items():
+                video_name = '_'.join(s_id.split('_')[:-1])
+                index = s_id.split('_')[-1]
+                
+                # Check for bad index
+                try: 
+                    idx = int(index)
+                except: 
+                    continue
+                    
+                time_range = video_segments._data[video_name][index]["time"] # "sss-eee"
+                start_sec = eval(time_range.split('-')[0])
+                end_sec = eval(time_range.split('-')[1])
+                
+                clips.append({
+                    "video_id": video_name,
+                    "index": idx,
+                    "start": start_sec,
+                    "end": end_sec,
+                    "caption": caption,
+                    "s_id": s_id
+                })
+            
+            # 2. Sort
+            clips.sort(key=lambda x: (x["video_id"], x["index"]))
+            
+            # 3. Merge Adjacent
+            merged_clips = []
+            if clips:
+                current_clip = clips[0]
+                for next_clip in clips[1:]:
+                    if (next_clip["video_id"] == current_clip["video_id"] and 
+                        next_clip["index"] == current_clip["index"] + 1):
+                        # Merge
+                        current_clip["end"] = next_clip["end"]
+                        current_clip["caption"] += " " + next_clip["caption"]
+                        # Update index to maintain continuity for subsequent checks
+                        current_clip["index"] = next_clip["index"] 
+                    else:
+                        merged_clips.append(current_clip)
+                        current_clip = next_clip
+                merged_clips.append(current_clip)
+            
+            # 4. Generate Links
+            for clip in merged_clips:
+                def fmt_time(t): return f"{int(t)//60:02d}:{int(t)%60:02d}"
+                display_time = f"{fmt_time(clip['start'])} - {fmt_time(clip['end'])}"
+                
+                link = f"{server_url}/api/library/videos/{clip['video_id']}/file#t={clip['start']},{clip['end']}"
+                
+                # Clean caption
+                long_cap = clip['caption']
+                clean_cap = long_cap.split('\n')[0][:150] + "..." if len(long_cap) > 150 else long_cap.split('\n')[0]
+                
+                response += f"* [{display_time}]({link}): {clean_cap}\n"
+    except Exception as e:
+        logger.warning(f"Failed to append clips: {e}")
+        import traceback
+        traceback.print_exc()
+
     return response
 
 async def videorag_query_multiple_choice(

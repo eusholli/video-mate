@@ -20,7 +20,7 @@ import atexit
 import psutil
 import hashlib
 import shutil
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from moviepy.editor import VideoFileClip
 import logging
@@ -643,6 +643,7 @@ def query_worker_process(session_id, query, global_config, server_url):
             openai_api_key=global_config.get("openai_api_key"),
             openai_base_url=global_config.get("openai_base_url"),
             imagebind_client=imagebind_client,
+            addon_params={"server_url": server_url},
         )
         
         
@@ -801,6 +802,47 @@ def create_app():
         lm = get_library_manager()
         lm.delete_video(video_id)
         return jsonify({"success": True})
+
+    @app.route("/api/library/videos/<video_id>/file", methods=["GET"])
+    def serve_video_file(video_id):
+        lm = get_library_manager()
+        video = lm.get_video(video_id)
+        if not video:
+             return jsonify({"success": False, "error": "Video not found"}), 404
+             
+        # video["original_path"] might be absolute or relative?
+        # Assuming absolute based on ingest.
+        # However, for safety and "library" concept, we should probably serve from library dir if we copied it there?
+        # In ingest_worker_process:
+        # target_path = os.path.join(working_dir, f"{video_id}{ext}")
+        # shutil.copy2(file_path, target_path)
+        
+        # So the video IS in the library dir: library/<video_id>/<video_id>.<ext>
+        # Let's find it.
+        lib_dir = os.path.join(lm.library_dir, video_id)
+        # We don't know the extension easily unless we store it or look for it.
+        # We can look for files starting with video_id in that dir.
+        
+        try:
+            files = os.listdir(lib_dir)
+            target_file = None
+            for f in files:
+                if f.startswith(video_id) and f != "vdb_chunks.json": # simple check, better: check extensions
+                    # Check if it is a video file?
+                    lower = f.lower()
+                    if lower.endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                        target_file = os.path.join(lib_dir, f)
+                        break
+            
+            if not target_file:
+                 # Fallback to original path if still exists?
+                 if os.path.exists(video["original_path"]):
+                     return send_file(video["original_path"])
+                 return jsonify({"success": False, "error": "Video file not found in library"}), 404
+                 
+            return send_file(target_file)
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
 
     # --- Session Endpoints ---
     @app.route("/api/sessions", methods=["GET"])

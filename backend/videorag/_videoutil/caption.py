@@ -268,35 +268,63 @@ async def _process_retrieved_segment_caption(
 
 async def retrieved_segment_caption_async(
     refine_knowledge,
-    retrieved_segments,
+    retrieved_segments_input, # Updated to accept segment objects
     video_path_db,
     video_segments,
     num_sampled_frames,
     global_config,
 ):
-    """Async retrieved segment caption generation"""
+    """Async retrieved segment caption generation with Hybrid Pipeline"""
+    
+    # Compatibility check: Handle list of objects (new) vs list of strings (old)
+    segments = []
+    if retrieved_segments_input and isinstance(retrieved_segments_input[0], dict):
+        segments = retrieved_segments_input
+    elif retrieved_segments_input:
+         # Fallback default
+         segments = [{"id": s, "type": "visual", "score": 0.0} for s in retrieved_segments_input]
 
-    # --- FIX: HARD LIMIT TO PREVENT TIMEOUTS ---
-    # Only process the top 3 most relevant segments.
-    # Processing 11 segments sequentially takes >3 mins and crashes the frontend.
-    if len(retrieved_segments) > 3:
-        logger.info(
-            f"⚠️ Throttling: Reducing segments from {len(retrieved_segments)} to 3 to prevent timeout."
-        )
-        retrieved_segments = list(retrieved_segments)[:3]
-    # -------------------------------------------
+    # 1. Separate Text vs Visual
+    # [Refactor] Move Entity Matches to Fast Path (treat as Text)
+    # Entities are text-based concepts, so they don't require expensive visual re-captioning.
+    text_candidates = [s for s in segments if s.get("type") in ["text", "entity"]]
+    visual_candidates = [s for s in segments if s.get("type") not in ["text", "entity"]]
+    
+    logger.info(f"Hybrid Search: {len(text_candidates)} text matches (Fast), {len(visual_candidates)} visual matches (Slow)")
 
-    logger.info(
-        f"🔍 Starting detailed caption for {len(retrieved_segments)} retrieved segments..."
-    )
+    caption_result = {}
 
-    # CRITICAL: Keep this at 1 for Tier 1 accounts
+    # 2. Fast Path: Process Text Matches (Unlimited, Instant)
+    for seg in text_candidates:
+        s_id = seg["id"]
+        try:
+            video_name = "_".join(s_id.split("_")[:-1])
+            index = s_id.split("_")[-1]
+            transcript = video_segments._data[video_name][index]["transcript"]
+            # Use transcript as caption directly
+            caption_result[s_id] = f"Caption:\n(Transcript Match)\nTranscript:\n{transcript}\n\n"
+        except Exception as e:
+            logger.warning(f"Failed to process text match {s_id}: {e}")
+
+    # 3. Slow Path: Process Visual Matches (Sorted, Top 3 Limit)
+    # Sort by score descending to get BEST visual matches
+    visual_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    visual_top_3 = visual_candidates[:3]
+    visual_rejects = visual_candidates[3:]
+    
+    if len(visual_candidates) > 3:
+        logger.info(f"⚠️ Visual Throttling: Processing Top 3 of {len(visual_candidates)} visual segments.")
+        logger.info(f"♻️ Downgrading {len(visual_rejects)} visual segments to Fast Path (Transcript Only).")
+        
+        # Add rejects to text candidates to accept them as transcript-only matches
+        text_candidates.extend(visual_rejects)
+
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def limited_process(this_segment):
+    async def limited_process(this_segment_id):
         async with sem:
             return await _process_retrieved_segment_caption(
-                this_segment,
+                this_segment_id,
                 refine_knowledge,
                 video_path_db,
                 video_segments,
@@ -305,10 +333,12 @@ async def retrieved_segment_caption_async(
             )
 
     results = await asyncio.gather(
-        *[limited_process(this_segment) for this_segment in retrieved_segments]
+        *[limited_process(seg["id"]) for seg in visual_top_3]
     )
 
-    caption_result = {segment_id: caption for segment_id, caption in results}
+    for segment_id, caption in results:
+        caption_result[segment_id] = caption
+
     logger.info(
         f"🎉 Retrieved caption generation completed! Generated {len(caption_result)} captions successfully."
     )
