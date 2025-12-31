@@ -112,13 +112,15 @@ async def segment_caption_async(
 
     logger.info(f"🎬 Extracting frames for {len(segment_index2name)} segments...")
     with VideoFileClip(video_path) as video:
-        segment_data = {
-            index: {
+        segment_data = {}
+        for index in segment_index2name:
+            t_obj = transcripts[index]
+            t_text = t_obj["text"] if isinstance(t_obj, dict) else t_obj
+            
+            segment_data[index] = {
                 "frames": encode_video(video, segment_times_info[index]["frame_times"]),
-                "transcript": transcripts[index],
+                "transcript": t_text,
             }
-            for index in segment_index2name
-        }
 
     logger.info(
         f"🎨 Starting caption generation for {len(segment_index2name)} segments..."
@@ -180,13 +182,23 @@ def merge_segment_information(
 ):
     inserting_segments = {}
     for index in segment_index2name:
+        t_obj = transcripts[index]
+        t_text = t_obj["text"] if isinstance(t_obj, dict) else t_obj
+        
         inserting_segments[index] = {"content": None, "time": None}
         segment_name = segment_index2name[index]
         inserting_segments[index]["time"] = "-".join(segment_name.split("-")[-2:])
         inserting_segments[index][
             "content"
-        ] = f"Caption:\n{captions[index]}\nTranscript:\n{transcripts[index]}\n\n"
-        inserting_segments[index]["transcript"] = transcripts[index]
+        ] = f"Caption:\n{captions[index]}\nTranscript:\n{t_text}\n\n"
+        
+        # Backward compatibility: 'transcript' is plain text
+        inserting_segments[index]["transcript"] = t_text
+        
+        # New field: 'detailed_transcript' (structured data)
+        if isinstance(t_obj, dict):
+            inserting_segments[index]["detailed_transcript"] = t_obj
+            
         inserting_segments[index]["frame_times"] = segment_times_info[index][
             "frame_times"
         ].tolist()

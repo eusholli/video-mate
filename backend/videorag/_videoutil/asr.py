@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 from tqdm import tqdm
 import dashscope
 from dashscope.audio.asr import Recognition
@@ -9,17 +10,22 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
     """
     Process a single audio segment with ASR
     """
-    # Check for cached transcript
-    txt_file = os.path.splitext(audio_file)[0] + ".txt"
-    if os.path.exists(txt_file):
+    api_json_file = os.path.splitext(audio_file)[0] + ".json"
+    
+    # Check for cached transcript (JSON format first)
+    if os.path.exists(api_json_file):
         try:
-            with open(txt_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-            if content.strip():
-                logger.info(f"Using cached transcript for {segment_name}")
-                return index, content.strip()
+            with open(api_json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if data and data.get('text'):
+                logger.info(f"Using cached transcript (JSON) for {segment_name}")
+                return index, data
         except Exception:
-            pass # Fallback to processing
+            pass
+
+    # Legacy text file check (fallback, but we probably want to re-process to get timestamps if missing)
+    # For now, if only text exists, we might miss timestamps. 
+    # Let's assume we proceed to processing if JSON is missing to ensure we get timestamps.
 
     async with semaphore:  # Limit concurrent requests
         try:
@@ -33,29 +39,42 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
                 callback=None  # type: ignore  # SDK type annotation issue
             )
             
-            # Call the API - Note: this might need to be wrapped in asyncio.to_thread for sync API
+            # Call the API
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, recognition.call, audio_file)
             
-            # logger.info(f"ASR result: {result}")
-            # Extract text from result
+            # Extract text and sentences from result
             if result and "output" in result and "sentence" in result["output"]:
-                sentences = result["output"]["sentence"]
-                asr_result = ""
-                for sentence in sentences:
-                    asr_result += sentence.get('text', '') + "\n"
+                sentences_data = result["output"]["sentence"]
+                full_text = ""
+                detailed_sentences = []
                 
-                # Cache the result
+                for sentence in sentences_data:
+                    text = sentence.get('text', '')
+                    full_text += text + "\n"
+                    detailed_sentences.append({
+                        "text": text,
+                        "start": sentence.get('begin_time'), # ms
+                        "end": sentence.get('end_time'),     # ms
+                        # "words": sentence.get('words', []) # Optional: capture words if needed
+                    })
+                
+                result_data = {
+                    "text": full_text.strip(),
+                    "sentences": detailed_sentences
+                }
+                
+                # Cache the result as JSON
                 try:
-                    with open(txt_file, 'w', encoding='utf-8') as f:
-                        f.write(asr_result)
+                    with open(api_json_file, 'w', encoding='utf-8') as f:
+                        json.dump(result_data, f, ensure_ascii=False, indent=2)
                 except Exception as e:
-                    logger.warning(f"Failed to cache transcript: {e}")
+                    logger.warning(f"Failed to cache transcript JSON: {e}")
 
-                return index, asr_result.strip()
+                return index, result_data
             else:
                 logger.warning(f"No transcription result for segment {segment_name}")
-                return index, ""
+                return index, {"text": "", "sentences": []}
                 
         except Exception as e:
             logger.error(f"ASR failed for segment {segment_name}: {str(e)}")

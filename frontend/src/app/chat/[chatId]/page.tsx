@@ -13,6 +13,7 @@ type Message = {
     role: "user" | "assistant";
     content: string;
     timestamp?: number;
+    clips?: any[];
 };
 
 export default function ChatPage() {
@@ -25,7 +26,9 @@ export default function ChatPage() {
     const [status, setStatus] = useState<any>(null); // Session status/metadata
     const [queryInfo, setQueryInfo] = useState<any>(null); // Current query status
     const [processing, setProcessing] = useState(false);
+    const [clipStatus, setClipStatus] = useState<any>(null); // Clip generation status
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const isSendingRef = useRef(false); // Ref for blocking updates
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -33,9 +36,6 @@ export default function ChatPage() {
 
     // Scroll to bottom when new messages arrive
     useEffect(() => {
-        // Only scroll if we have messages and the last message is different or length changed
-        // Simple heuristic: if length changed.
-        // For deeper check we could compare IDs, but length is usually sufficient for chat.
         if (messages.length > 0) {
             scrollToBottom();
         }
@@ -49,17 +49,18 @@ export default function ChatPage() {
     }, [messages.length]);
 
     const loadSession = async () => {
+        if (isSendingRef.current) return; // Skip if sending
+
         try {
             const res = await api.getSession(chatId);
             if (res.success) {
-                // Only update messages if length changed to avoid jitter, or if we need to sync content
-                // But for now, we just set it. The scroll effect protects us from jitter.
                 setMessages(res.history);
                 setStatus(res.session);
 
                 const qDetails = res.status;
-                const isProcessing = qDetails && qDetails.status === 'processing';
+                const cDetails = (res as any).clip_status; // Type assertion until specific type defined
 
+                const isProcessing = qDetails && qDetails.status === 'processing';
                 setProcessing(isProcessing);
 
                 if (isProcessing) {
@@ -67,6 +68,8 @@ export default function ChatPage() {
                 } else {
                     setQueryInfo(null);
                 }
+
+                setClipStatus(cDetails);
             }
         } catch (e) {
             console.error("Sync failed", e);
@@ -78,7 +81,7 @@ export default function ChatPage() {
         loadSession();
         const interval = setInterval(loadSession, 2000);
         return () => clearInterval(interval);
-    }, [chatId]); // Removed 'processing' dependency to avoid re-setting interval constantly
+    }, [chatId]);
 
     const handleSend = async () => {
         if (!input.trim() || processing) return;
@@ -86,22 +89,38 @@ export default function ChatPage() {
         const userMsg = input.trim();
         setInput("");
         setProcessing(true);
+        isSendingRef.current = true; // Block updates
 
         // Optimistic update
         const tempMsg: Message = { role: "user", content: userMsg, timestamp: Date.now() / 1000 };
         setMessages(prev => [...prev, tempMsg]);
 
         try {
-            // Wait for query to acknowledge
             await api.querySession(chatId, userMsg);
-            // Immediately fetch session to confirm status/history
+            isSendingRef.current = false; // Unblock
             await loadSession();
         } catch (err: any) {
             console.error(err);
             setProcessing(false);
+            isSendingRef.current = false; // Unblock
             alert("Failed to send message");
-            // Revert optimistic update? For now just leave it or reload.
             loadSession();
+        }
+    };
+
+    const handleGenerateClips = async () => {
+        // Find last user message
+        const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+        if (!lastUserMsg) return;
+
+        try {
+            // Optimistic set
+            setClipStatus({ status: "processing" });
+            await api.generateClips(chatId, lastUserMsg.content);
+            // Polling will pick up result
+        } catch (e) {
+            alert("Failed to start clip generation");
+            setClipStatus(null);
         }
     };
 
@@ -111,6 +130,11 @@ export default function ChatPage() {
             handleSend();
         }
     };
+
+    // Check if we should show clip button
+    // Show if: Not processing query, Last message is Assistant, and (ClipStatus is null OR ClipStatus is completed/error)
+    const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+    const showClipButton = !processing && lastMsg?.role === 'assistant' && !lastMsg?.clips;
 
     return (
         <div className="flex flex-col h-screen bg-background text-foreground">
@@ -140,17 +164,50 @@ export default function ChatPage() {
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-6 md:p-8 md:max-w-3xl md:mx-auto w-full">
                 {messages.map((msg, idx) => (
-                    <div key={idx} className={cn("flex w-full", msg.role === "user" ? "justify-end" : "justify-start")}>
-                        <div className={cn(
-                            "max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-sm",
-                            msg.role === "user"
-                                ? "bg-primary text-primary-foreground font-medium rounded-tr-none"
-                                : "bg-muted text-foreground rounded-tl-none border"
-                        )}>
-                            <div className={cn("prose prose-sm max-w-none", msg.role === "user" ? "text-primary-foreground [&_p]:text-primary-foreground" : "dark:prose-invert")}>
-                                <ReactMarkdown>{msg.content}</ReactMarkdown>
+                    <div key={idx} className="flex flex-col w-full gap-2">
+                        <div className={cn("flex w-full", msg.role === "user" ? "justify-end" : "justify-start")}>
+                            <div className={cn(
+                                "max-w-[80%] rounded-2xl px-5 py-3 text-sm leading-relaxed shadow-sm",
+                                msg.role === "user"
+                                    ? "bg-primary text-primary-foreground font-medium rounded-tr-none"
+                                    : "bg-muted text-foreground rounded-tl-none border"
+                            )}>
+                                <div className={cn("prose prose-sm max-w-none", msg.role === "user" ? "text-primary-foreground [&_p]:text-primary-foreground" : "dark:prose-invert")}>
+                                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+                                </div>
                             </div>
                         </div>
+
+                        {/* Render Attached Clips */}
+                        {msg.clips && msg.clips.length > 0 && (
+                            <div className="w-full max-w-2xl mx-auto space-y-4 pt-2">
+                                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider pl-2">Generated Evidence</h3>
+                                <div className="grid grid-cols-1 gap-4">
+                                    {msg.clips.map((clip: any, i: number) => (
+                                        <div key={i} className="border rounded-lg overflow-hidden bg-card shadow-sm">
+                                            <div className="aspect-video bg-black relative group">
+                                                {/* Use HTML5 Video. Add preload="metadata" */}
+                                                <video
+                                                    src={clip.url}
+                                                    controls
+                                                    className="w-full h-full object-contain"
+                                                    preload="metadata"
+                                                />
+                                            </div>
+                                            <div className="p-3">
+                                                <div className="flex justify-between items-start mb-1">
+                                                    <h4 className="font-medium text-sm line-clamp-1" title={clip.title}>{clip.title}</h4>
+                                                    <span className="text-xs font-mono text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                                                        {Math.round(clip.score * 100)}% Match
+                                                    </span>
+                                                </div>
+                                                <p className="text-xs text-muted-foreground italic line-clamp-2">"{clip.caption}"</p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
                     </div>
                 ))}
 
@@ -163,6 +220,36 @@ export default function ChatPage() {
                         </div>
                     </div>
                 )}
+
+                {/* Active Clip Generation Indicator */}
+                <div className="w-full">
+                    {clipStatus?.status === 'processing' && (
+                        <div className="flex items-center gap-2 text-sm text-muted-foreground p-4 bg-muted/30 rounded-lg animate-pulse">
+                            <span className="loading-spinner">🎥</span> Generating precise clips...
+                        </div>
+                    )}
+
+                    {/* Error State */}
+                    {clipStatus?.status === 'error' && (
+                        <div className="text-red-500 text-sm p-4 bg-red-50 dark:bg-red-900/10 rounded-lg">
+                            Error: {clipStatus.message || "Failed to generate clips"}
+                        </div>
+                    )}
+
+                    {showClipButton && (!clipStatus || clipStatus.status !== 'processing') && (
+                        <div className="flex justify-center mt-6">
+                            <Button
+                                variant="outline"
+                                className="gap-2 border-primary/20 hover:border-primary/50"
+                                onClick={handleGenerateClips}
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                                Generate Relevant Clips
+                            </Button>
+                        </div>
+                    )}
+                </div>
+
                 <div ref={messagesEndRef} />
             </div>
 

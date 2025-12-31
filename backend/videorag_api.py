@@ -53,6 +53,9 @@ from videorag._llm import (
 )
 from videorag import VideoRAG, QueryParam
 from videorag.unified_storage import UnifiedNanoVectorDBStorage
+from videorag._op import search_precise_clips
+import video_clip_api
+from video_clip_api import generate_clip_file
 
 # Log recording function
 def log_to_file(message, log_file="log.txt"):
@@ -360,11 +363,6 @@ def ingest_worker_process(video_id, file_path, global_config, server_url, resume
         def progress_callback(percent, step, msg):
              log_to_file(f"[{video_id}] {percent}% {step}: {msg}")
              try:
-                 # Update status in library.json
-                 # Re-instantiate lib_mgr inside callback to ensure freshness?
-                 # Or just use the one we have? Usage is safe if we don't hold big state.
-                 # But we need to use a fresh instance or method that reads/writes atomically.
-                 # LibraryManager.update_status re-reads the file every time.
                  lib_mgr.update_status(video_id, "processing", progress=percent, phase=step)
              except Exception as e:
                  log_to_file(f"Failed to update progress for {video_id}: {e}")
@@ -432,47 +430,22 @@ def ingest_worker_process(video_id, file_path, global_config, server_url, resume
         lib_mgr = LibraryManager(global_config["base_storage_path"])
         lib_mgr.update_status(video_id, "error", str(e))
 
-def query_worker_process(session_id, query, global_config, server_url):
+def setup_session_rag(session_id, global_config, server_url, force_rebuild=False):
     """
-    Worker for querying. Sets up UnifiedStorage.
+    Setup VideoRAG instance for a session (Merging DBs if needed).
     """
-    import setproctitle
-    setproctitle.setproctitle(f"videorag-query-{session_id}")
+    sess_mgr = SessionManager(global_config["base_storage_path"])
+    lib_mgr = LibraryManager(global_config["base_storage_path"])
     
-    try:
-        sess_mgr = SessionManager(global_config["base_storage_path"])
-        lib_mgr = LibraryManager(global_config["base_storage_path"])
-        
-        session = sess_mgr.get_session(session_id)
-        if not session: raise ValueError("Session not found")
-        
-        # Collect VDB paths
-        vdb_paths = []
-        for vid in session["video_ids"]:
-            # Library path: library/<vid>/vdb_chunks.json
-            p = os.path.join(lib_mgr.library_dir, vid, "vdb_chunks.json")
-            if os.path.exists(p):
-                vdb_paths.append(p)
-            else:
-                 # Check if video_segment_feature vdb exists? 
-                 # Unified storage usually just merges chunks (text) or all VDBs?
-                 # My UnifiedStorage impl looked for `unified_vdb_{namespace}.json`
-                 # and merged from source paths.
-                 pass
-        
-        # We need to unify "chunks" (for text retrieval) and maybe "entities"?
-        # For simplicity, UnifiedNanoVectorDBStorage implementation assumes it merges whatever is passed.
-        # VideoRAG uses multiple VDBs: entities, chunks, video_segment_feature.
-        # We need to merge ALL of them for "unified" experience?
-        # Or just Text Chunks?
-        # videorag_query checks entities_vdb, chunks_vdb, video_segment_feature_vdb.
-        # So we need Unified version for ALL 3 types.
-        
-        session_dir = os.path.join(sess_mgr.sessions_dir, session_id)
-        
-        # We need to PREPARE the unified DBs before querying?
-        # Or `UnifiedNanoVectorDBStorage` does it on init.
-        # We should do it here.
+    session = sess_mgr.get_session(session_id)
+    if not session: raise ValueError("Session not found")
+    
+    session_dir = os.path.join(sess_mgr.sessions_dir, session_id)
+    
+    # Check if we need to rebuild (if forced or missing files)
+    chunks_vdb_path = os.path.join(session_dir, "vdb_chunks.json")
+    if force_rebuild or not os.path.exists(chunks_vdb_path):
+        log_to_file(f"🔨 Rebuilding session DBs for {session_id}")
         
         # 1. Chunks
         chunks_paths = [os.path.join(lib_mgr.library_dir, vid, "vdb_chunks.json") for vid in session["video_ids"]]
@@ -482,101 +455,37 @@ def query_worker_process(session_id, query, global_config, server_url):
         
         # 3. Video Features
         features_paths = [os.path.join(lib_mgr.library_dir, vid, "vdb_video_segment_feature.json") for vid in session["video_ids"]]
-
-        # Helper to init unified
-        async def init_unified(paths, namespace):
-             if not paths: return None
-             u = UnifiedNanoVectorDBStorage(
-                 namespace=namespace,
-                 global_config={"working_dir": session_dir, "llm": {"embedding_batch_num": 32}},
-                 embedding_func=openai_embedding, # Dummy, not used during merge really
-                 source_vdb_paths=paths
-             )
-             await u.initialize_session_db()
-             return u
-
-        # We actually need to pass these configured classes to VideoRAG.
-        # VideoRAG instantiation is complex.
-        # We will dynamically override the storage classes used by this instance?
-        # Or just pass the Unified class type?
-        # VideoRAG accepts `vector_db_storage_cls`.
-        # usage: `self.chunks_vdb = self.vector_db_storage_cls(...)`
-        # But `UnifiedNanoVectorDBStorage` needs `source_vdb_paths`.
-        # Standard VideoRAG doesn't know how to pass `source_vdb_paths`.
         
-        # Approach:
-        # We subclass VideoRAG or we just hack the instance.
-        # Or we pre-initialize the Unified DBs, and then tell VideoRAG to use `NanoVectorDBStorage` 
-        # but pointed to `unified_vdb_chunks.json`.
-        
-        # If we pre-initialize `unified_vdb_chunks.json` in `session_dir`,
-        # And then Initialize VideoRAG with `working_dir=session_dir` and namespace="chunks",
-        # `NanoVectorDBStorage` will look for `vdb_chunks.json`.
-        # My UnifiedStorage created `unified_vdb_chunks.json`.
-        # I should rename it to `vdb_chunks.json` inside the session dir!
-        # Then standard VideoRAG will pick it up as if it's a local VDB.
-        # THIS IS THE CLEANEST WAY! no code change in VideoRAG query logic.
-        
-        # So: Merge VDBs -> Save as `vdb_chunks.json` in session dir.
-        # VideoRAG(working_dir=session_dir) -> reads `vdb_chunks.json`.
-        
-        # Implementation of Merge:
         from nano_vectordb import NanoVectorDB
         
         def merge_vdb(source_paths, target_path, dim):
             # Create/Reset target
             client = NanoVectorDB(dim, storage_file=target_path)
-            # Load sources
             data_buffer = []
             
             for sp in source_paths:
                 if os.path.exists(sp):
                     try:
-                        # Use NanoVectorDB to load the file (handles all decoding logic)
                         source_client = NanoVectorDB(dim, storage_file=sp)
-                        
-                        # Access internal storage to get data and vectors
-                        # Name mangling for private attribute __storage
                         storage = getattr(source_client, '_NanoVectorDB__storage', {})
-                        
                         if isinstance(storage, dict) and "data" in storage and "matrix" in storage:
                             items = storage["data"]
                             matrix = storage["matrix"]
-                            
-                            # NanoVectorDB loads 'matrix' as a numpy array and 'data' as list
-                            # We can trust that loaded lengths match or are handled by lib
-                            valid_count = len(items)
-                            
-                            if len(matrix) >= valid_count:
+                            if len(matrix) >= len(items):
                                 for i, item in enumerate(items):
                                     new_item = item.copy() 
                                     new_item["__vector__"] = matrix[i]
                                     data_buffer.append(new_item)
-                            else:
-                                log_to_file(f"Mismatch in VDB {sp}: {valid_count} items vs {len(matrix)} vectors")
-                                
                     except Exception as e:
                         log_to_file(f"Failed to merge VDB {sp}: {e}")
 
             if data_buffer:
-                # Upsert handles everything
                 client.upsert(data_buffer)
-                
             client.save()
-            return True
             
-        # Merge Chunks (Dim 1536)
         merge_vdb(chunks_paths, os.path.join(session_dir, "vdb_chunks.json"), 1536)
-        # Merge Entities (Dim 1536)
         merge_vdb(entities_paths, os.path.join(session_dir, "vdb_entities.json"), 1536)
-        # Merge Video Features (Dim 1024)
         merge_vdb(features_paths, os.path.join(session_dir, "vdb_video_segment_feature.json"), 1024)
-        
-        # Also need to merge KVs? `text_chunks`, `video_segments`, `video_path`?
-        # VideoRAG uses `JsonKVStorage`.
-        # `text_chunks` (kv_store_text_chunks.json) - maps ID to content.
-        # Yes, we need these. `NanoVectorDB` only stores vectors + meta fields by ID.
-        # VideoRAG retrieves full content from KV store.
         
         def merge_kv(source_paths, target_path):
              merged = {}
@@ -596,17 +505,8 @@ def query_worker_process(session_id, query, global_config, server_url):
         
         kv_paths_paths = [os.path.join(lib_mgr.library_dir, vid, "kv_store_video_path.json") for vid in session["video_ids"]]
         merge_kv(kv_paths_paths, os.path.join(session_dir, "kv_store_video_path.json"))
-
-        # Merge Graph? (chunk_entity_relation)
-        # It's a graphml file? Or storage? 
-        # `NetworkXStorage` uses `graph_{namespace}.graphml`.
-        # Merging graphml files is harder. 
-        # But VideoRAG uses graph for `videorag_query` (GraphRAG).
-        # Should we assume Graph is per video and we just union them?
-        # NetworkX has `compose` or `union`.
-        # If we skip graph merge, GraphRAG might not see cross-video connections (which represents new knowledge anyway).
-        # We can try to load all graphs and merge them using networkx.
         
+        # Merge Graph
         try:
             import networkx as nx
             G = nx.Graph()
@@ -619,56 +519,65 @@ def query_worker_process(session_id, query, global_config, server_url):
         except Exception as e:
             log_to_file(f"Graph merge failed: {e}")
 
-        # SETUP DONE. Now Query.
-        
-        imagebind_client = HTTPImageBindClient(server_url)
-        videorag_llm_config = LLMConfig(
-             # Same config as usual
-            embedding_func_raw=openai_embedding,
-            embedding_model_name="text-embedding-3-small",
-            embedding_dim=1536,
-            embedding_max_token_size=8192,
-            embedding_batch_num=32,
-            embedding_func_max_async=16,
-            query_better_than_threshold=0.2,
-            best_model_func_raw=gpt_complete,
-            best_model_name=global_config.get("analysisModel"),
-            best_model_max_token_size=32768,
-            best_model_max_async=16,
-            cheap_model_func_raw=gpt_complete,
-            cheap_model_name=global_config.get("processingModel"),
-            cheap_model_max_token_size=32768,
-            cheap_model_max_async=16,
-            caption_model_func_raw=dashscope_caption_complete,
-            caption_model_name=global_config.get("caption_model"),
-            caption_model_max_async=3,
-        )
-        
-        # Collect Video Titles for display
-        def clean_title(v):
-            original = v.get("title", os.path.basename(v.get("original_path", "Unknown")))
-            # Try to strip "1234567890_" prefix if present
-            import re
-            match = re.match(r'^\d+_(.*)$', original)
-            if match:
-                return match.group(1)
-            return original
+    # SETUP RAG INSTANCE
+    imagebind_client = HTTPImageBindClient(server_url)
+    videorag_llm_config = LLMConfig(
+        embedding_func_raw=openai_embedding,
+        embedding_model_name="text-embedding-3-small",
+        embedding_dim=1536,
+        embedding_max_token_size=8192,
+        embedding_batch_num=32,
+        embedding_func_max_async=16,
+        query_better_than_threshold=0.2,
+        best_model_func_raw=gpt_complete,
+        best_model_name=global_config.get("analysisModel"),
+        best_model_max_token_size=32768,
+        best_model_max_async=16,
+        cheap_model_func_raw=gpt_complete,
+        cheap_model_name=global_config.get("processingModel"),
+        cheap_model_max_token_size=32768,
+        cheap_model_max_async=16,
+        caption_model_func_raw=dashscope_caption_complete,
+        caption_model_name=global_config.get("caption_model"),
+        caption_model_max_async=3,
+    )
+    
+    # Collect Video Titles for display
+    def clean_title(v):
+        original = v.get("title", os.path.basename(v.get("original_path", "Unknown")))
+        import re
+        match = re.match(r'^\d+_(.*)$', original)
+        if match: return match.group(1)
+        return original
 
-        video_titles = {v["id"]: clean_title(v) for v in lib_mgr.list_videos()}
+    video_titles = {v["id"]: clean_title(v) for v in lib_mgr.list_videos()}
 
-        rag = VideoRAG(
-            llm=videorag_llm_config,
-            working_dir=session_dir, # Points to Unified Data
-            ali_dashscope_api_key=global_config.get("ali_dashscope_api_key"),
-            ali_dashscope_base_url=global_config.get("ali_dashscope_base_url"),
-            caption_model=global_config.get("caption_model"),
-            asr_model=global_config.get("asr_model"),
-            openai_api_key=global_config.get("openai_api_key"),
-            openai_base_url=global_config.get("openai_base_url"),
-            imagebind_client=imagebind_client,
-            addon_params={"server_url": server_url, "video_titles": video_titles},
-        )
+    rag = VideoRAG(
+        llm=videorag_llm_config,
+        working_dir=session_dir,
+        ali_dashscope_api_key=global_config.get("ali_dashscope_api_key"),
+        ali_dashscope_base_url=global_config.get("ali_dashscope_base_url"),
+        caption_model=global_config.get("caption_model"),
+        asr_model=global_config.get("asr_model"),
+        openai_api_key=global_config.get("openai_api_key"),
+        openai_base_url=global_config.get("openai_base_url"),
+        imagebind_client=imagebind_client,
+        addon_params={"server_url": server_url, "video_titles": video_titles},
+    )
+    return rag
+
+def query_worker_process(session_id, query, global_config, server_url):
+    """
+    Worker for querying.
+    """
+    import setproctitle
+    setproctitle.setproctitle(f"videorag-query-{session_id}")
+    
+    try:
+        sess_mgr = SessionManager(global_config["base_storage_path"])
+        session_dir = os.path.join(sess_mgr.sessions_dir, session_id)
         
+        rag = setup_session_rag(session_id, global_config, server_url, force_rebuild=True)
         
         param = QueryParam(mode="videorag")
         param.wo_reference = True
@@ -677,16 +586,11 @@ def query_worker_process(session_id, query, global_config, server_url):
         # History Handling
         history_file = os.path.join(session_dir, "history.json")
         history = ensure_json_file(history_file, [])
-        
-        # NOTE: User message is already appended by endpoint.
-        
-        # Append AI Msg
         history.append({
             "role": "assistant", 
             "content": response, 
             "timestamp": datetime.datetime.now().isoformat()
         })
-        
         save_json_file(history_file, history)
         
         # Update Status
@@ -695,10 +599,6 @@ def query_worker_process(session_id, query, global_config, server_url):
         save_json_file(status_file, res)
         
         # Update Session Last Active
-        # We need to lock or be careful with session.json if multiple write?
-        # SessionManager writes to single sessions.json.
-        # Worker process should probably NOT write to sessions.json directly if concurrency is high.
-        # But for MVP, we can read-modify-write.
         try:
             sm = SessionManager(global_config["base_storage_path"])
             # reload to get fresh
@@ -712,11 +612,134 @@ def query_worker_process(session_id, query, global_config, server_url):
         
     except Exception as e:
         log_to_file(f"Query Process Failed: {e}")
-        # Update status
         try:
-            status_file = os.path.join(sess_mgr.sessions_dir, session_id, "status.json")
+            status_file = os.path.join(os.path.join(sess_mgr.sessions_dir, session_id), "status.json")
             save_json_file(status_file, {"query_status": {"status": "error", "message": str(e)}})
         except: pass
+
+def clip_generator_worker(session_id, query, global_config, server_url):
+    """
+    Worker to find and generate clips.
+    """
+    import asyncio
+    try:
+        log_to_file(f"Generating clips for session {session_id}, query: {query}")
+        # Reuse existing DBs (no force rebuild)
+        rag = setup_session_rag(session_id, global_config, server_url, force_rebuild=False)
+        
+        # Run search
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        clips = loop.run_until_complete(search_precise_clips(
+            query,
+            rag.entities_vdb,
+            rag.text_chunks,
+            rag.chunks_vdb,
+            rag.video_segments,
+            rag.video_segment_feature_vdb,
+            rag.chunk_entity_relation_graph,
+            QueryParam(mode="videorag"),
+            rag.safe_config
+        ))
+        
+        # Generate Clip Files
+        generated_clips = []
+        lib_mgr = LibraryManager(global_config["base_storage_path"])
+        
+        for clip in clips:
+            video_id = clip["video_id"]
+            start = clip["start"]
+            end = clip["end"]
+            
+            # Output path: library/<vid>/clips/<start-end>.mp4
+            clips_dir = os.path.join(lib_mgr.library_dir, video_id, "clips")
+            os.makedirs(clips_dir, exist_ok=True)
+            output_name = f"clip_{int(start*1000)}_{int(end*1000)}.mp4"
+            output_path = os.path.join(clips_dir, output_name)
+            
+            video_entry = lib_mgr.get_video(video_id)
+            if not video_entry: continue
+            
+            original_path = video_entry.get("original_path")
+            # Or use working dir path?
+            # Ideally use the one in working dir (rag knows it?)
+            # rag.video_path_db stores it?
+            # Let's fallback to original_path
+            
+            # Check if exists
+            if not os.path.exists(output_path):
+                # Generate
+                success = generate_clip_file(original_path, start, end, output_path)
+                if not success: continue
+            
+            # Add URL
+            # URL: /api/library/videos/<vid>/clips/<output_name>
+            clip["url"] = f"{server_url}/api/library/videos/{video_id}/clips/{output_name}"
+            # Add Title/Thumb?
+            clip["title"] = video_entry.get("title", "Video")
+            generated_clips.append(clip)
+            
+        # Update Session with these clips?
+        # Or just return? The endpoint is async polled?
+        # The user wants "return a list of clips". 
+        # API is POST -> returns Job ID? Or waits?
+        # If we wait, it might timeout.
+        # Let's write to a status file for "clip_generation"? or append to history?
+        # Request says: "The above replaces the existing clip return service."
+        # "button... triggers the transcript searching, generating, and returning..."
+        
+        # If I want to return them to frontend, I should probably save them to a file that frontend polls?
+        # OR, since we are using `querySession` which polls `status.json`.
+        # I can reuse `status.json` structure?
+        # `status.json` has `query_status`.
+        # I can add `clip_status`.
+        
+        sess_mgr = SessionManager(global_config["base_storage_path"])
+        session_dir = os.path.join(sess_mgr.sessions_dir, session_id)
+        status_file = os.path.join(session_dir, "status.json")
+        
+        # Read existing to preserve query_status?
+        current = ensure_json_file(status_file, {})
+        current["clip_status"] = {
+            "status": "completed",
+            # We don't need to store clips here anymore since they go to history
+            # But keeping them for now doesn't hurt, helps debugging
+            "clips": generated_clips 
+        }
+        save_json_file(status_file, current)
+        
+        # --- Persist to History ---
+        history_path = os.path.join(session_dir, "history.json")
+        try:
+             import datetime
+             history = ensure_json_file(history_path, [])
+             history.append({
+                 "role": "assistant", 
+                 "content": "Here are the relevant clips based on your request:", 
+                 "clips": generated_clips,
+                 "timestamp": datetime.datetime.now().isoformat()
+             })
+             with open(history_path, 'w') as f:
+                 import json
+                 json.dump(history, f, indent=2)
+        except Exception as e:
+            log_to_file(f"Failed to append clips to history: {e}")
+        
+    except Exception as e:
+        log_to_file(f"Clip generation failed: {e}")
+        # Write error
+        try:
+            sess_mgr = SessionManager(global_config["base_storage_path"])
+            session_dir = os.path.join(sess_mgr.sessions_dir, session_id)
+            status_file = os.path.join(session_dir, "status.json")
+            current = ensure_json_file(status_file, {})
+            current["clip_status"] = {"status": "error", "message": str(e)}
+            save_json_file(status_file, current)
+        except: pass
+
+# --- FLASK ENDPOINTS FOR CLIPS ---
+pass # Handled in create_app modification next
 
 
 # --- Flask App ---
@@ -867,6 +890,12 @@ def create_app():
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 
+    @app.route("/api/library/videos/<video_id>/clips/<filename>", methods=["GET"])
+    def serve_clip_file(video_id, filename):
+        lm = get_library_manager()
+        clips_dir = os.path.join(lm.library_dir, video_id, "clips")
+        return send_file(os.path.join(clips_dir, filename))
+
     # --- Session Endpoints ---
     @app.route("/api/sessions", methods=["GET"])
     def list_sessions():
@@ -908,7 +937,8 @@ def create_app():
             "success": True, 
             "session": session, 
             "history": history, 
-            "status": status.get("query_status")
+            "status": status.get("query_status"),
+            "clip_status": status.get("clip_status")
         })
 
     @app.route("/api/sessions/<session_id>/query", methods=["POST"])
@@ -937,7 +967,10 @@ def create_app():
              
              # Update Status to Processing immediately
              status_path = os.path.join(sm.sessions_dir, session_id, "status.json")
-             save_json_file(status_path, {"query_status": {"status": "processing"}})
+             # Read existing to preserve clip_status if any
+             current_status = ensure_json_file(status_path, {})
+             current_status["query_status"] = {"status": "processing"}
+             save_json_file(status_path, current_status)
              
         except Exception as e:
              log_to_file(f"Failed to sync save history/status: {e}")
@@ -947,16 +980,44 @@ def create_app():
         p.start()
         
         return jsonify({"success": True, "status": "processing"})
+
+    @app.route("/api/sessions/<session_id>/clips", methods=["POST"])
+    def generate_session_clips(session_id):
+        data = request.json
+        query = data.get("query") # Use the query the user wants clips for
+        
+        _, _, config = load_and_init_global_config()
+        server_url = f"http://localhost:{globals().get('SERVER_PORT', 64451)}"
+        
+        sm = get_session_manager()
+        status_path = os.path.join(sm.sessions_dir, session_id, "status.json")
+        
+        # Update Status
+        try:
+            current = ensure_json_file(status_path, {})
+            current["clip_status"] = {"status": "processing"}
+            save_json_file(status_path, current)
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+        # Spawn Worker
+        p = multiprocessing.Process(target=clip_generator_worker, args=(session_id, query, config, server_url))
+        p.start()
+        
+        return jsonify({"success": True, "status": "processing"})
         
     @app.route("/api/sessions/<session_id>/status", methods=["GET"])
     def get_query_status(session_id):
-        # ... existing implementation is fine, but maybe redundant if get_session_details exists
-        pass # keeping old endpoint just in case, or remove if unused.
         sm = get_session_manager()
         p = os.path.join(sm.sessions_dir, session_id, "status.json")
         if os.path.exists(p):
              with open(p, 'r') as f:
-                 return jsonify({"success": True, "status": json.load(f).get("query_status")})
+                 st = json.load(f)
+                 return jsonify({
+                     "success": True, 
+                     "status": st.get("query_status"),
+                     "clip_status": st.get("clip_status")
+                 })
         return jsonify({"success": False, "status": "unknown"})
 
     # --- ImageBind Internal ---

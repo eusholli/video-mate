@@ -571,6 +571,148 @@ async def _extract_keywords_query(
     final_result = await use_llm_func(keywords_prompt)
     return final_result
 
+async def _retrieve_and_filter_segments(
+    query,
+    entities_vdb,
+    text_chunks_db,
+    chunks_vdb,
+    video_segments,
+    video_segment_feature_vdb,
+    knowledge_graph_inst,
+    query_param: QueryParam,
+    global_config: dict,
+):
+    use_model_func = global_config["llm"]["best_model_func"]
+    
+    # naive chunks
+    results = await chunks_vdb.query(query, top_k=query_param.top_k)
+    chunks_ids = [r["id"] for r in results] if results else []
+    chunks = await text_chunks_db.get_by_ids(chunks_ids)
+
+    maybe_trun_chunks = truncate_list_by_token_size(
+        chunks,
+        key=lambda x: x["content"],
+        max_token_size=query_param.naive_max_token_for_text_unit,
+    )
+    logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
+    section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
+    retreived_chunk_context = section if maybe_trun_chunks else "No Content"
+    
+    # Gather text segments with metadata
+    text_segment_objects = []
+    for c in maybe_trun_chunks:
+        if "video_segment_id" in c:
+            for s_id in c["video_segment_id"]:
+                text_segment_objects.append({"id": s_id, "type": "text", "score": 10.0})
+    
+    # Entity retrieval
+    query_for_entity_retrieval = await _refine_entity_retrieval_query(
+        query, query_param, global_config
+    )
+    entity_results = await entities_vdb.query(query_for_entity_retrieval, top_k=query_param.top_k)
+    entity_retrieved_objects = []
+    
+    entity_retrieved_ids = set()
+    if len(entity_results):
+        node_datas = await asyncio.gather(
+            *[knowledge_graph_inst.get_node(r["entity_name"]) for r in entity_results]
+        )
+        # Filter None
+        node_datas = [n for n in node_datas if n is not None]
+        
+        # We need to re-match with entity_results but index might shift if some are None?
+        # Safe way:
+        # Re-fetch only successful ones or just map carefully.
+        # Original code used zip but filtered None.
+        # Assuming get_node returns None if missing.
+        
+        # Simplified for safety:
+        # Just use what we have.
+        
+        # Recalculate node degrees for valid nodes only?
+        # Original logic was complex with zip. I'll simplify relying on `_find_most_related...`
+        # Using a safer pattern:
+        valid_nodes = []
+        for r in entity_results:
+            n = await knowledge_graph_inst.get_node(r["entity_name"])
+            if n:
+                 d = await knowledge_graph_inst.node_degree(r["entity_name"])
+                 valid_nodes.append({**n, "entity_name": r["entity_name"], "rank": d})
+
+        entity_retrieved_ids = entity_retrieved_ids.union(await _find_most_related_segments_from_entities(
+            global_config["retrieval_topk_chunks"], valid_nodes, text_chunks_db, knowledge_graph_inst
+        ))
+        for eid in entity_retrieved_ids:
+             entity_retrieved_objects.append({"id": eid, "type": "entity", "score": 2.0})
+
+    # Visual retrieval
+    query_for_visual_retrieval = await _refine_visual_retrieval_query(
+        query, query_param, global_config
+    )
+    segment_results = await video_segment_feature_vdb.query(query_for_visual_retrieval)
+    visual_retrieved_objects = []
+    if len(segment_results):
+        for n in segment_results:
+            visual_retrieved_objects.append({"id": n['__id__'], "type": "visual", "score": n.get('distance', 0.0)})
+    
+    # Consolidate and Deduplicate
+    all_retrieved_objects = text_segment_objects + entity_retrieved_objects + visual_retrieved_objects
+    unique_segments = {}
+    for obj in all_retrieved_objects:
+        sid = obj["id"]
+        if sid not in unique_segments:
+            unique_segments[sid] = obj
+        else:
+            existing = unique_segments[sid]
+            if obj["type"] == "visual":
+                unique_segments[sid] = obj
+            elif obj["type"] == existing["type"] and obj["score"] > existing["score"]:
+                unique_segments[sid] = obj
+                
+    retrieved_segments = list(unique_segments.values())
+    
+    # Filtering
+    already_processed = 0
+    async def _filter_single_segment(knowledge: str, segment_key_dp: tuple[str, str]):
+        nonlocal use_model_func, already_processed
+        segment_key = segment_key_dp[0]
+        segment_content = segment_key_dp[1]
+        filter_prompt = PROMPTS["filtering_segment"]
+        filter_prompt = filter_prompt.format(caption=segment_content, knowledge=knowledge)
+        result = await use_model_func(filter_prompt, global_config=global_config)
+        already_processed += 1
+        return (segment_key, result)
+    
+    rough_captions = {}
+    for seg_obj in retrieved_segments:
+        s_id = seg_obj["id"]
+        # Safe split
+        parts = s_id.split('_')
+        if len(parts) < 2: continue
+        video_name = '_'.join(parts[:-1])
+        index = parts[-1]
+        try:
+            rough_captions[s_id] = video_segments._data[video_name][index]["content"]
+        except:
+            continue
+
+    results = await asyncio.gather(
+        *[_filter_single_segment(query, (s_id, rough_captions[s_id])) for s_id in rough_captions]
+    )
+    
+    remain_segment_ids = [x[0] for x in results if 'yes' in x[1].lower()]
+    remain_segments = [unique_segments[rid] for rid in remain_segment_ids if rid in unique_segments]
+    
+    
+    if len(remain_segments) == 0:
+        if global_config.get("strict_filtering", False):
+            # For precise clips, returning nothing is better than garbage
+            return [], retreived_chunk_context
+        remain_segments = retrieved_segments # Fallback
+        
+    return remain_segments, retreived_chunk_context
+
+
 async def videorag_query(
     query,
     entities_vdb,
@@ -582,166 +724,17 @@ async def videorag_query(
     knowledge_graph_inst,
     query_param: QueryParam,
     global_config: dict,
-) -> str:
+):
     use_model_func = global_config["llm"]["best_model_func"]
-    query = query
     
-    # naive chunks
-    results = await chunks_vdb.query(query, top_k=query_param.top_k)
-    if not len(results):
-        return PROMPTS["fail_response"]
-    chunks_ids = [r["id"] for r in results]
-    chunks = await text_chunks_db.get_by_ids(chunks_ids)
-
-    maybe_trun_chunks = truncate_list_by_token_size(
-        chunks,
-        key=lambda x: x["content"],
-        max_token_size=query_param.naive_max_token_for_text_unit,
+    # 1. Retrieve & Filter
+    remain_segments, retreived_chunk_context = await _retrieve_and_filter_segments(
+        query, entities_vdb, text_chunks_db, chunks_vdb, video_segments, 
+        video_segment_feature_vdb, knowledge_graph_inst, query_param, global_config
     )
-    logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
-    section = "-----New Chunk-----\n".join([c["content"] for c in maybe_trun_chunks])
-    retreived_chunk_context = section
     
-    # [Refactor] Gather text segments with metadata
-    logger.info(f"DEBUG: Checking {len(maybe_trun_chunks)} text chunks for video_segment_id")
-    if len(maybe_trun_chunks) > 0:
-        logger.info(f"DEBUG: Sample Chunk Keys: {maybe_trun_chunks[0].keys()}")
-        logger.info(f"DEBUG: Sample Chunk Content: {maybe_trun_chunks[0]}")
-
-    text_segment_objects = []
-    for c in maybe_trun_chunks:
-        if "video_segment_id" in c:
-            for s_id in c["video_segment_id"]:
-                # Text matches are high confidence. Assign score 1.0 (or higher?)
-                text_segment_objects.append({"id": s_id, "type": "text", "score": 10.0})
-    
-    # visual retrieval
-    query_for_entity_retrieval = await _refine_entity_retrieval_query(
-        query,
-        query_param,
-        global_config,
-    )
-    entity_results = await entities_vdb.query(query_for_entity_retrieval, top_k=query_param.top_k)
-    entity_results = await entities_vdb.query(query_for_entity_retrieval, top_k=query_param.top_k)
-    entity_retrieved_segments = set()
-    entity_retrieved_objects = []
-    if len(entity_results):
-        node_datas = await asyncio.gather(
-            *[knowledge_graph_inst.get_node(r["entity_name"]) for r in entity_results]
-        )
-        if not all([n is not None for n in node_datas]):
-            logger.warning("Some nodes are missing, maybe the storage is damaged")
-        node_degrees = await asyncio.gather(
-            *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in entity_results]
-        )
-        node_datas = [
-            {**n, "entity_name": k["entity_name"], "rank": d}
-            for k, n, d in zip(entity_results, node_datas, node_degrees)
-            if n is not None
-        ]
-        entity_retrieved_ids = entity_retrieved_segments.union(await _find_most_related_segments_from_entities(
-            global_config["retrieval_topk_chunks"], node_datas, text_chunks_db, knowledge_graph_inst
-        ))
-        for eid in entity_retrieved_ids:
-             entity_retrieved_objects.append({"id": eid, "type": "entity", "score": 2.0}) # Medium priority
-    
-    # visual retrieval
-    query_for_visual_retrieval = await _refine_visual_retrieval_query(
-        query,
-        query_param,
-        global_config,
-    )
-    segment_results = await video_segment_feature_vdb.query(query_for_visual_retrieval)
-    visual_retrieved_objects = []
-    if len(segment_results):
-        for n in segment_results:
-            # Capture actual distance from vector DB
-            visual_retrieved_objects.append({"id": n['__id__'], "type": "visual", "score": n.get('distance', 0.0)})
-    
-    # caption
-    # Consolidate all objects
-    all_retrieved_objects = text_segment_objects + entity_retrieved_objects + visual_retrieved_objects
-    
-    # Deduplicate by ID, keeping highest score/priority
-    unique_segments = {}
-    for obj in all_retrieved_objects:
-        sid = obj["id"]
-        if sid not in unique_segments:
-            unique_segments[sid] = obj
-        else:
-            # [Fix] Visual Priority: If current or new is visual, keep/make it visual.
-            # This ensures we don't downgrade a visual match to a text match
-            # which would skip the visual captioning path.
-            existing = unique_segments[sid]
-            
-            # If the NEW object is visual, it should upgrade the existing one
-            if obj["type"] == "visual":
-                unique_segments[sid] = obj
-            # If both are same type (or new is not visual), keep highest score
-            elif obj["type"] == existing["type"] and obj["score"] > existing["score"]:
-                unique_segments[sid] = obj
-                
-    retrieved_segments = list(unique_segments.values())
-    # No sorting here, passing full objects to caption function
-    
-    logger.info(query_for_entity_retrieval)
-    logger.info(f"Retrieved Segments Count: {len(retrieved_segments)}")
-    logger.info(query_for_entity_retrieval)
-    logger.info(f"Retrieved Entity Objects: {len(entity_retrieved_objects)}")
-    logger.info(query_for_visual_retrieval)
-    logger.info(f"Retrieved Visual Objects: {len(visual_retrieved_objects)}")
-    
-    already_processed = 0
-    async def _filter_single_segment(knowledge: str, segment_key_dp: tuple[str, str]):
-        nonlocal use_model_func, already_processed
-        segment_key = segment_key_dp[0]
-        segment_content = segment_key_dp[1]
-        filter_prompt = PROMPTS["filtering_segment"]
-        filter_prompt = filter_prompt.format(caption=segment_content, knowledge=knowledge)
-        result = await use_model_func(filter_prompt, global_config=global_config)
-        already_processed += 1
-        now_ticks = PROMPTS["process_tickers"][
-            already_processed % len(PROMPTS["process_tickers"])
-        ]
-        logger.info(f"{now_ticks} Checked {already_processed} segments\r")
-        return (segment_key, result)
-    
-    rough_captions = {}
-    for seg_obj in retrieved_segments:
-        s_id = seg_obj["id"]
-        video_name = '_'.join(s_id.split('_')[:-1])
-        index = s_id.split('_')[-1]
-        rough_captions[s_id] = video_segments._data[video_name][index]["content"]
-    results = await asyncio.gather(
-        *[_filter_single_segment(query, (s_id, rough_captions[s_id])) for s_id in rough_captions]
-    )
-    # [Fix] Preserve metadata (type/score) by mapping IDs back to objects
-    remain_segment_ids = [x[0] for x in results if 'yes' in x[1].lower()]
-    
-    # Create lookup map
-    id_to_obj = {seg["id"]: seg for seg in retrieved_segments}
-    
-    remain_segments = []
-    for rid in remain_segment_ids:
-        if rid in id_to_obj:
-            remain_segments.append(id_to_obj[rid])
-            
-    logger.info(f"{len(remain_segments)} Video Segments remain after filtering")
-    
-    if len(remain_segments) == 0:
-        logger.info("Since no segments remain after filtering, we utilized all the retrieved segments.")
-        # Stick to objects if possible
-        remain_segments = retrieved_segments
-        
-    logger.info(f"Remain segments objects count: {len(remain_segments)}")
-    
-    # visual retrieval
-    keywords_for_caption = await _extract_keywords_query(
-        query,
-        query_param,
-        global_config,
-    )
-    logger.info(f"Keywords: {keywords_for_caption}")
+    # 2. Captioning (Hybrid)
+    keywords_for_caption = await _extract_keywords_query(query, query_param, global_config)
     caption_results = await retrieved_segment_caption_async(
         keywords_for_caption,
         remain_segments,
@@ -751,117 +744,168 @@ async def videorag_query(
         global_config=global_config,
     )
 
-    ## data table
+    # 3. Form Context
     text_units_section_list = [["video_name", "start_time", "end_time", "content"]]
     for s_id in caption_results:
         video_name = '_'.join(s_id.split('_')[:-1])
         index = s_id.split('_')[-1]
-        start_time = eval(video_segments._data[video_name][index]["time"].split('-')[0])
-        end_time = eval(video_segments._data[video_name][index]["time"].split('-')[1])
-        start_time = f"{start_time // 3600}:{(start_time % 3600) // 60}:{start_time % 60}"
-        end_time = f"{end_time // 3600}:{(end_time % 3600) // 60}:{end_time % 60}"
-        text_units_section_list.append([video_name, start_time, end_time, caption_results[s_id]])
+        try:
+            time_str = video_segments._data[video_name][index]["time"]
+            start_time = eval(time_str.split('-')[0])
+            end_time = eval(time_str.split('-')[1])
+            start_fmt = f"{start_time // 3600}:{(start_time % 3600) // 60}:{start_time % 60}"
+            end_fmt = f"{end_time // 3600}:{(end_time % 3600) // 60}:{end_time % 60}"
+            text_units_section_list.append([video_name, start_fmt, end_fmt, caption_results[s_id]])
+        except: continue
+        
     text_units_context = list_of_list_to_csv(text_units_section_list)
-
     retreived_video_context = f"\n-----Retrieved Knowledge From Videos-----\n```csv\n{text_units_context}\n```\n"
     
-    if query_param.wo_reference:
-        sys_prompt_temp = PROMPTS["videorag_response_wo_reference"]
-    else:
-        sys_prompt_temp = PROMPTS["videorag_response"]
-        
+    # 4. Generate Answer (Text Only)
+    sys_prompt_temp = PROMPTS["videorag_response_wo_reference"] if query_param.wo_reference else PROMPTS["videorag_response"]
     sys_prompt = sys_prompt_temp.format(
         video_data=retreived_video_context,
         chunk_data=retreived_chunk_context,
         response_type=query_param.response_type
     )
+    
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
         global_config=global_config,
     )
+    return response
+
+
+async def search_precise_clips(
+    query,
+    entities_vdb,
+    text_chunks_db,
+    chunks_vdb,
+    video_segments,
+    video_segment_feature_vdb,
+    knowledge_graph_inst,
+    query_param: QueryParam,
+    global_config: dict,
+):
+    """
+    Find relevant clips with PRECISE sentence-level alignment.
+    """
+    from ._utils import limit_async_func_call
+    # Upgrade to Best Model for higher precision (slower but worth it)
+    use_model_func = global_config["llm"]["best_model_func"] 
     
-    # --- Append Relevant Clips ---
-    try:
-        if caption_results:
-            response += "\n\n### Relevant Clips\n"
-            server_url = global_config.get("addon_params", {}).get("server_url", "http://localhost:64451")
-            
-            # Create Score Lookup
-            score_map = {seg['id']: seg.get('score', 0.0) for seg in remain_segments}
+    # 1. Retrieve & Filter (Reuse logic)
+    # Enable strict filtering to avoid fallbacks
+    filtered_config = global_config.copy()
+    filtered_config["strict_filtering"] = True
+    
+    remain_segments, _ = await _retrieve_and_filter_segments(
+        query, entities_vdb, text_chunks_db, chunks_vdb, video_segments, 
+        video_segment_feature_vdb, knowledge_graph_inst, query_param, filtered_config
+    )
+    
+    if not remain_segments:
+        return []
 
-            # 1. Parse into structured objects
-            clips = []
-            for s_id, caption in caption_results.items():
-                video_name = '_'.join(s_id.split('_')[:-1])
-                index = s_id.split('_')[-1]
-                
-                # Check for bad index
-                try: 
-                    idx = int(index)
-                except: 
-                    continue
-                    
-                time_range = video_segments._data[video_name][index]["time"] # "sss-eee"
-                start_sec = eval(time_range.split('-')[0])
-                end_sec = eval(time_range.split('-')[1])
-                
-                clips.append({
-                    "video_id": video_name,
-                    "index": idx,
-                    "start": start_sec,
-                    "end": end_sec,
-                    "caption": caption,
-                    "s_id": s_id,
-                    "score": score_map.get(s_id, 0.0)
-                })
-            
-            # 2. Sort
-            clips.sort(key=lambda x: (x["video_id"], x["index"]))
-            
-            # 3. Merge Adjacent
-            merged_clips = []
-            if clips:
-                current_clip = clips[0]
-                for next_clip in clips[1:]:
-                    if (next_clip["video_id"] == current_clip["video_id"] and 
-                        next_clip["index"] == current_clip["index"] + 1):
-                        # Merge
-                        current_clip["end"] = next_clip["end"]
-                        current_clip["caption"] += " " + next_clip["caption"]
-                        current_clip["score"] = max(current_clip["score"], next_clip["score"])
-                        # Update index to maintain continuity for subsequent checks
-                        current_clip["index"] = next_clip["index"] 
-                    else:
-                        merged_clips.append(current_clip)
-                        current_clip = next_clip
-                merged_clips.append(current_clip)
+    # 2. Extract Precise Sentences
+    clips = []
+    
+    # Limit processing to top 5 segments for speed
+    top_segments = sorted(remain_segments, key=lambda x: x.get('score', 0), reverse=True)[:5]
+    
+    async def process_precise_clip(seg):
+        s_id = seg["id"]
+        parts = s_id.split('_')
+        video_name = '_'.join(parts[:-1])
+        index = parts[-1]
+        
+        segment_info = video_segments._data[video_name][index]
+        detailed_transcript = segment_info.get("detailed_transcript")
+        
+        # Default/Fallback time (30s)
+        time_range = segment_info["time"]
+        start_sec = eval(time_range.split('-')[0])
+        end_sec = eval(time_range.split('-')[1])
+        
+        caption = segment_info["transcript"] # Default caption
 
-            # Sort by Relevancy Score (Descending)
-            merged_clips.sort(key=lambda x: x["score"], reverse=True)
-            
-            # 4. Generate Links
-            # Get video titles from addon_params
-            video_titles = global_config.get("addon_params", {}).get("video_titles", {})
-            
-            for clip in merged_clips:
-                def fmt_time(t): return f"{int(t)//60:02d}:{int(t)%60:02d}"
-                display_time = f"{fmt_time(clip['start'])} - {fmt_time(clip['end'])}"
+        if detailed_transcript and detailed_transcript.get("sentences"):
+            # Use LLM to pick relevant sentences
+            sentences = detailed_transcript["sentences"]
+            # Format identifying list
+            sent_list_str = ""
+            for i, s in enumerate(sentences):
+                sent_list_str += f"{i}: {s['text']}\n"
                 
-                link = f"{server_url}/api/library/videos/{clip['video_id']}/file#t={clip['start']},{clip['end']}"
-                
-                # Get Title
-                title = video_titles.get(clip['video_id'], "Unknown Video")
-                
-                # Clean caption - Remove "(Transcript Match) Transcript:" (handling newlines) and extra newlines
-                clean_cap = clip['caption'].replace('(Transcript Match)\nTranscript:', '').replace('(Transcript Match) Transcript:', '').replace('Caption:\n', '').replace('Caption: ', '').replace('\n', ' ').strip()
-                
-                response += f"* **{title}** [{display_time}]({link}): {clean_cap}\n"
-    except Exception as e:
-        logger.warning(f"Failed to append clips: {e}")
-        import traceback
-        traceback.print_exc()
+            prompt = f"""Query: {query}
 
+Transcript Sentences:
+{sent_list_str}
+
+Identify the indices of the sentences that are STRICTLY relevant to answering the query.
+First, explain your reasoning in one sentence.
+Then, provide the indices in a JSON list.
+
+Example Output:
+Reasoning: The user asks about X, and sentences 2 and 3 discuss X directly.
+Indices: [2, 3]
+
+If no sentences are strictly relevant, return [].
+"""
+            
+            try:
+                res = await use_model_func(prompt)
+                import json
+                import re
+                
+                indices = []
+                # Try finding JSON array pattern
+                json_match = re.search(r'\[(.*?)\]', res, re.DOTALL)
+                if json_match:
+                    try:
+                        # Validate it's a list of ints
+                        content = json_match.group(1)
+                        if not content.strip(): 
+                             indices = []
+                        else:
+                             # robust split by comma
+                             indices = [int(x.strip()) for x in content.split(',') if x.strip().isdigit()]
+                    except:
+                        pass
+                
+                # If regex failed or empty, maybe fallback but be careful
+                # For now, if we can't parse a list, assume NO relevance (cleaner than random numbers)
+                if not indices and "None" in res:
+                     indices = []
+                
+                if indices:
+                    # Find min start and max end
+                    relevant_sents = [sentences[i] for i in indices if i < len(sentences)]
+                    if relevant_sents:
+                        # Snap to start/end
+                        start_sec = relevant_sents[0]["start"] / 1000.0 # ms -> s
+                        end_sec = relevant_sents[-1]["end"] / 1000.0 # ms -> s
+                        caption = " ".join([s["text"] for s in relevant_sents])
+            except Exception as e:
+                logger.warning(f"Failed precise extraction for {s_id}: {e}")
+
+        return {
+            "video_id": video_name,
+            "start": float(start_sec),
+            "end": float(end_sec),
+            "caption": caption,
+            "score": float(seg.get('score', 0))
+        }
+
+    results = await asyncio.gather(*[process_precise_clip(seg) for seg in top_segments])
+    clips = [r for r in results if r]
+    
+    # Sort and Filter overlap?
+    clips.sort(key=lambda x: x["score"], reverse=True)
+    
+    return clips
+    
     return response
 
 async def videorag_query_multiple_choice(

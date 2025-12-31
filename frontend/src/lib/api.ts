@@ -101,6 +101,9 @@ export const api = {
     async getSessionStatus(id: string): Promise<{ success: boolean; status: any }> {
         return this.get(`/api/sessions/${id}/status`);
     },
+    async generateClips(id: string, query: string): Promise<{ success: boolean; status: string }> {
+        return this.post(`/api/sessions/${id}/clips`, { query });
+    },
 };
 
 export interface VideoEntry {
