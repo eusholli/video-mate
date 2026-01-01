@@ -825,10 +825,20 @@ async def search_precise_clips(
         
         # Default/Fallback time (30s)
         time_range = segment_info["time"]
-        start_sec = eval(time_range.split('-')[0])
-        end_sec = eval(time_range.split('-')[1])
+        try:
+            # Handle float or int strings properly
+            seg_start_offset = float(time_range.split('-')[0])
+            seg_end_offset = float(time_range.split('-')[1])
+        except:
+             # Fallback if parsing fails
+             seg_start_offset = 0.0
+             seg_end_offset = 30.0
+
+        start_sec = seg_start_offset
+        end_sec = seg_end_offset
         
         caption = segment_info["transcript"] # Default caption
+        speaker_id = None
 
         if detailed_transcript and detailed_transcript.get("sentences"):
             # Use LLM to pick relevant sentences
@@ -836,27 +846,24 @@ async def search_precise_clips(
             # Format identifying list
             sent_list_str = ""
             for i, s in enumerate(sentences):
-                sent_list_str += f"{i}: {s['text']}\n"
+                spk = s.get("speaker_id", "?")
+                sent_list_str += f"{i} [Spk {spk}]: {s['text']}\n"
                 
-            prompt = f"""Query: {query}
+            prompt = f"""Query/Context: {query}
 
 Transcript Sentences:
 {sent_list_str}
 
-Identify the indices of the sentences that are STRICTLY relevant to answering the query.
-Return *only* a JSON object with the following schema:
+Identify the indices of the sentences that are relevant to the query.
+- Select continuous sentences if they form a complete thought or speech.
+- If the query implies a specific speaker's speech, select the full relevant segment for that speaker.
+- If unsure, select the sentences containing the keywords from the query.
+
+Return *only* a JSON object:
 {{
-  "reasoning": "string explanation",
+  "reasoning": "explanation",
   "indices": [int]
 }}
-
-Example:
-{{
-  "reasoning": "Sentences 2 and 3 discuss the query directly.",
-  "indices": [2, 3]
-}}
-
-If no sentences are strictly relevant, return empty indices.
 """
             
             try:
@@ -876,19 +883,42 @@ If no sentences are strictly relevant, return empty indices.
                     # Find min start and max end
                     relevant_sents = [sentences[i] for i in indices if i < len(sentences)]
                     if relevant_sents:
-                        # Snap to start/end
-                        start_sec = relevant_sents[0]["start"] / 1000.0 # ms -> s
-                        end_sec = relevant_sents[-1]["end"] / 1000.0 # ms -> s
+                        # Snap to start/end relative to segment + segment offset
+                        # Timestamps in 'start'/'end' are ms relative to segment start
+                        rel_start = relevant_sents[0]["start"] / 1000.0 # ms -> s
+                        rel_end = relevant_sents[-1]["end"] / 1000.0 # ms -> s
+                        
+                        start_sec = seg_start_offset + rel_start
+                        end_sec = seg_start_offset + rel_end
+                        
                         caption = " ".join([s["text"] for s in relevant_sents])
+                        
+                        # Determine dominant speaker
+                        speakers = [s.get("speaker_id") for s in relevant_sents if s.get("speaker_id") is not None]
+                        if speakers:
+                            # Use Counter to find most common speaker
+                            from collections import Counter
+                            speaker_id = Counter(speakers).most_common(1)[0][0]
+                else:
+                    # Strict Mode: If we have transcripts but LLM found NOTHING relevant,
+                    # DO NOT include this segment (avoid irrelevant fallbacks).
+                    # Exception: If specific keywords match? No, rely on LLM.
+                    return None
+
             except Exception as e:
                 logger.warning(f"Failed precise extraction for {s_id}: {e}")
+                # If LLM fails (exception), do we keep it? 
+                # Safer to discard to avoid noise, or keep as fallback?
+                # Let's keep as fallback if exception occurs (safe).
+                pass
 
         return {
             "video_id": video_name,
             "start": float(start_sec),
             "end": float(end_sec),
             "caption": caption,
-            "score": float(seg.get('score', 0))
+            "score": float(seg.get('score', 0)),
+            "speaker_id": speaker_id
         }
 
     results = await asyncio.gather(*[process_precise_clip(seg) for seg in top_segments])
@@ -906,29 +936,29 @@ If no sentences are strictly relevant, return empty indices.
     
     # 0.5s padding
     PADDING = 0.5
-    MERGE_THRESHOLD = 1.0 # If gap is less than 1s, merge
+    DEFAULT_MERGE_THRESHOLD = 2.0 # Allow 2s gap to simulate continuous speech since we lack speaker_id
     
     # Apply initial padding to first clip match (start only for now, end is dynamic)
     current_clip["start"] = max(0.0, current_clip["start"] - PADDING)
-    # End padding is applied when finalizing a clip
     
     for next_clip in raw_clips[1:]:
         # Check if same video
         if next_clip["video_id"] == current_clip["video_id"]:
-            # Check overlap or proximity (accounting for potential padding of next clip)
-            # We want to know if (current.end + padding) overlaps with (next.start - padding)
-            # Effectively, if gap < (PADDING * 2 + MERGE_THRESHOLD)? 
-            # Let's simplify: if gap < MERGE_THRESHOLD, strict merge.
             
             gap = next_clip["start"] - current_clip["end"]
             
-            if gap <= MERGE_THRESHOLD:
+            # Since we cannot detect speakers reliably in this region (Singpore/International),
+            # we will assume clips within a short time window (2.0s) belong to the same flow/speaker
+            # and merge them to create a continuous clip.
+            threshold = DEFAULT_MERGE_THRESHOLD
+            
+            if gap <= threshold:
                 # Merge
                 current_clip["end"] = max(current_clip["end"], next_clip["end"])
                 # Merge captions if not duplicate
                 if next_clip["caption"] not in current_clip["caption"]:
                     current_clip["caption"] += " " + next_clip["caption"]
-                # Keep highest score? Or average?
+                # Keep highest score
                 current_clip["score"] = max(current_clip["score"], next_clip["score"])
                 continue
 

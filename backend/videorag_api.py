@@ -991,7 +991,29 @@ def create_app():
         
         sm = get_session_manager()
         status_path = os.path.join(sm.sessions_dir, session_id, "status.json")
+        history_path = os.path.join(sm.sessions_dir, session_id, "history.json")
         
+        # Strategy 1: Use the previously generated answer as context
+        try:
+             history = ensure_json_file(history_path, [])
+             # Find last assistant message
+             last_answer = None
+             for msg in reversed(history):
+                 if msg.get("role") == "assistant":
+                     last_answer = msg.get("content")
+                     break
+             
+             if last_answer:
+                 # Check if it's a string (it should be)
+                 if isinstance(last_answer, str):
+                     # Limit length to avoid token limits? 
+                     # Let's truncate reasonably, e.g. 1000 chars or just pass it.
+                     # The answer is usually concise.
+                     query = f"{query}\n\nContext from Answer:\n{last_answer}"
+                     log_to_file(f"Enriched query with previous answer length: {len(last_answer)}")
+        except Exception as e:
+            log_to_file(f"Failed to fetch history for context: {e}")
+
         # Update Status
         try:
             current = ensure_json_file(status_path, {})

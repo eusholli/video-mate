@@ -5,6 +5,8 @@ from tqdm import tqdm
 import dashscope
 from dashscope.audio.asr import Recognition
 from .._utils import logger
+import subprocess
+import uuid
 
 async def process_single_segment(semaphore, index, segment_name, audio_file, model, audio_output_format, sample_rate):
     """
@@ -17,6 +19,8 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
         try:
             with open(api_json_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            
+            # Cache check modified to be lenient as we might fallback to non-diarized model
             if data and data.get('text'):
                 logger.info(f"Using cached transcript (JSON) for {segment_name}")
                 return index, data
@@ -28,57 +32,82 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
     # Let's assume we proceed to processing if JSON is missing to ensure we get timestamps.
 
     async with semaphore:  # Limit concurrent requests
+        # Create temp file for conversion (Mono 16k)
+        temp_audio = f"{audio_file}_{uuid.uuid4().hex}.mp3"
+        
+        result = None # Initialize result
         try:
             logger.info(f"Processing segment {segment_name} with model {model}")
-            # Create recognition instance
+            # Convert to Mono 16kHz using ffmpeg
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_file,
+                "-ac", "1", "-ar", "16000",
+                "-loglevel", "error",
+                temp_audio
+            ]
+            subprocess.run(cmd, check=True)
+            
+            # Use temp file for recognition
             recognition = Recognition(
                 model=model,
-                format=audio_output_format,
-                sample_rate=sample_rate,
+                format="mp3", # We converted to mp3
+                sample_rate=16000,
                 language_hints=['en'],
+                diarization_enabled=False, # Not supported on fun-asr-realtime
                 callback=None  # type: ignore  # SDK type annotation issue
             )
             
             # Call the API
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, recognition.call, audio_file)
+            result = await loop.run_in_executor(None, recognition.call, temp_audio)
             
-            # Extract text and sentences from result
-            if result and "output" in result and "sentence" in result["output"]:
-                sentences_data = result["output"]["sentence"]
-                full_text = ""
-                detailed_sentences = []
-                
-                for sentence in sentences_data:
-                    text = sentence.get('text', '')
-                    full_text += text + "\n"
-                    detailed_sentences.append({
-                        "text": text,
-                        "start": sentence.get('begin_time'), # ms
-                        "end": sentence.get('end_time'),     # ms
-                        # "words": sentence.get('words', []) # Optional: capture words if needed
-                    })
-                
-                result_data = {
-                    "text": full_text.strip(),
-                    "sentences": detailed_sentences
-                }
-                
-                # Cache the result as JSON
-                try:
-                    with open(api_json_file, 'w', encoding='utf-8') as f:
-                        json.dump(result_data, f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logger.warning(f"Failed to cache transcript JSON: {e}")
-
-                return index, result_data
-            else:
-                logger.warning(f"No transcription result for segment {segment_name}")
-                return index, {"text": "", "sentences": []}
-                
         except Exception as e:
-            logger.error(f"ASR failed for segment {segment_name}: {str(e)}")
-            raise e
+            logger.error(f"ASR failed for segment {segment_name}: {e}")
+            result = None
+        finally:
+             if os.path.exists(temp_audio):
+                 os.remove(temp_audio)
+
+        if result and result.status_code == 200:
+            # Extract text and sentences from result
+            text = ""
+            if "payload" in result.output:
+                 # Realtime model structure
+                 # Note: structure might differ, usually output has 'sentence'
+                 pass
+            
+            # Standard Recognition output
+            sentences_data = result.output.get("sentence", [])
+            full_text = ""
+            detailed_sentences = []
+            
+            for sentence in sentences_data:
+                s_text = sentence.get('text', '')
+                full_text += s_text + " "
+                detailed_sentences.append({
+                    "text": s_text,
+                    "start": sentence.get('begin_time'), # ms
+                    "end": sentence.get('end_time'),     # ms
+                    "speaker_id": sentence.get('speaker_id') # Might be None
+                })
+            
+            response_json = {
+                "text": full_text.strip(),
+                "sentences": detailed_sentences
+            }
+            
+            # Cache the result as JSON
+            try:
+                with open(api_json_file, 'w', encoding='utf-8') as f:
+                    json.dump(response_json, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                 logger.error(f"Failed to save JSON cache: {e}")
+                 
+            return index, response_json
+        else:
+            msg = result.message if result else "Unknown error"
+            logger.error(f"ASR Task failed for segment {segment_name}: {msg}")
+            return index, {"text": "", "sentences": []}
 
 async def speech_to_text_online(video_name, working_dir, segment_index2name, audio_output_format, global_config, max_concurrent=5):
     """
