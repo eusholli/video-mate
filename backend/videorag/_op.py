@@ -844,40 +844,33 @@ Transcript Sentences:
 {sent_list_str}
 
 Identify the indices of the sentences that are STRICTLY relevant to answering the query.
-First, explain your reasoning in one sentence.
-Then, provide the indices in a JSON list.
+Return *only* a JSON object with the following schema:
+{{
+  "reasoning": "string explanation",
+  "indices": [int]
+}}
 
-Example Output:
-Reasoning: The user asks about X, and sentences 2 and 3 discuss X directly.
-Indices: [2, 3]
+Example:
+{{
+  "reasoning": "Sentences 2 and 3 discuss the query directly.",
+  "indices": [2, 3]
+}}
 
-If no sentences are strictly relevant, return [].
+If no sentences are strictly relevant, return empty indices.
 """
             
             try:
-                res = await use_model_func(prompt)
+                # Use JSON Mode
+                res = await use_model_func(prompt, response_format={"type": "json_object"})
                 import json
-                import re
                 
                 indices = []
-                # Try finding JSON array pattern
-                json_match = re.search(r'\[(.*?)\]', res, re.DOTALL)
-                if json_match:
-                    try:
-                        # Validate it's a list of ints
-                        content = json_match.group(1)
-                        if not content.strip(): 
-                             indices = []
-                        else:
-                             # robust split by comma
-                             indices = [int(x.strip()) for x in content.split(',') if x.strip().isdigit()]
-                    except:
-                        pass
-                
-                # If regex failed or empty, maybe fallback but be careful
-                # For now, if we can't parse a list, assume NO relevance (cleaner than random numbers)
-                if not indices and "None" in res:
-                     indices = []
+                try:
+                    data = json.loads(res)
+                    indices = data.get("indices", [])
+                except Exception as e:
+                    logger.warning(f"Failed to parse JSON for {s_id}: {e}")
+                    indices = []
                 
                 if indices:
                     # Find min start and max end
@@ -899,14 +892,63 @@ If no sentences are strictly relevant, return [].
         }
 
     results = await asyncio.gather(*[process_precise_clip(seg) for seg in top_segments])
-    clips = [r for r in results if r]
+    raw_clips = [r for r in results if r]
     
-    # Sort and Filter overlap?
-    clips.sort(key=lambda x: x["score"], reverse=True)
+    if not raw_clips:
+        return []
+
+    # 3. Merge Adjacent/Overlapping Clips and Apply Padding
+    # Sort by video_id then start time
+    raw_clips.sort(key=lambda x: (x["video_id"], x["start"]))
     
-    return clips
+    merged_clips = []
+    current_clip = raw_clips[0]
     
-    return response
+    # 0.5s padding
+    PADDING = 0.5
+    MERGE_THRESHOLD = 1.0 # If gap is less than 1s, merge
+    
+    # Apply initial padding to first clip match (start only for now, end is dynamic)
+    current_clip["start"] = max(0.0, current_clip["start"] - PADDING)
+    # End padding is applied when finalizing a clip
+    
+    for next_clip in raw_clips[1:]:
+        # Check if same video
+        if next_clip["video_id"] == current_clip["video_id"]:
+            # Check overlap or proximity (accounting for potential padding of next clip)
+            # We want to know if (current.end + padding) overlaps with (next.start - padding)
+            # Effectively, if gap < (PADDING * 2 + MERGE_THRESHOLD)? 
+            # Let's simplify: if gap < MERGE_THRESHOLD, strict merge.
+            
+            gap = next_clip["start"] - current_clip["end"]
+            
+            if gap <= MERGE_THRESHOLD:
+                # Merge
+                current_clip["end"] = max(current_clip["end"], next_clip["end"])
+                # Merge captions if not duplicate
+                if next_clip["caption"] not in current_clip["caption"]:
+                    current_clip["caption"] += " " + next_clip["caption"]
+                # Keep highest score? Or average?
+                current_clip["score"] = max(current_clip["score"], next_clip["score"])
+                continue
+
+        # Finalize current clip
+        current_clip["end"] += PADDING
+        merged_clips.append(current_clip)
+        
+        # Start new clip
+        current_clip = next_clip
+        current_clip["start"] = max(0.0, current_clip["start"] - PADDING)
+        
+    # Append last
+    current_clip["end"] += PADDING
+    merged_clips.append(current_clip)
+    
+    # Sort by score for final presentation
+    merged_clips.sort(key=lambda x: x["score"], reverse=True)
+    
+    return merged_clips
+
 
 async def videorag_query_multiple_choice(
     query,
