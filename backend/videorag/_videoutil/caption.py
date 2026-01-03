@@ -267,14 +267,13 @@ async def _process_retrieved_segment_caption(
                 else ""
             )
 
-            result = f"Caption:\n{this_caption}\nTranscript:\n{segment_transcript}\n\n"
+            result = this_caption
             return this_segment, result
 
     except Exception as e:
         logger.info(f"❌ Retrieved caption failed for segment {this_segment}: {str(e)}")
         return (
-            this_segment,
-            f"Caption:\nError generating caption\nTranscript:\n{segment_transcript}\n\n",
+            "Error generating caption",
         )
 
 
@@ -314,7 +313,7 @@ async def retrieved_segment_caption_async(
             index = s_id.split("_")[-1]
             transcript = video_segments._data[video_name][index]["transcript"]
             # Use transcript as caption directly
-            caption_result[s_id] = f"Caption:\n(Transcript Match)\nTranscript:\n{transcript}\n\n"
+            caption_result[s_id] = transcript
         except Exception as e:
             logger.warning(f"Failed to process text match {s_id}: {e}")
 

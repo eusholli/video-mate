@@ -134,12 +134,10 @@ export function ResearchChat({ sessionId, onSourceClick }: ResearchChatProps) {
 
                             {/* Source Cards */}
                             {m.sources && m.sources.length > 0 && (
-                                <div className="mt-4 flex flex-col gap-3 w-full animate-in fade-in slide-in-from-bottom-2">
+                                <div className="mt-4 flex flex-col gap-3 w-full max-w-[85%] animate-in fade-in slide-in-from-bottom-2">
                                     {m.sources.map((src: any, j: number) => {
                                         // Clean text content
-                                        let content = src.content || "";
-                                        // Remove metadata prefixes common in RAG output
-                                        content = content.replace(/Caption:\s*/g, "").replace(/Transcript:\s*/g, "").replace(/\(Transcript Match\)/g, "").trim();
+                                        const content = src.content || "";
 
                                         // Format timestamps
                                         const formatTime = (seconds: number) => {
