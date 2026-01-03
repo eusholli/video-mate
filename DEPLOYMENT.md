@@ -1,6 +1,6 @@
 # Video Mate Deployment Guide (Hetzner CPX41 Edition)
 
-This guide provides step-by-step instructions to deploy Video Mate on a **Hetzner Cloud CPX41** server. This server was chosen for its excellent price/performance ratio (8 vCPUs, 16GB RAM) which is critical for handling the AI models without crashing.
+This guide provides step-by-step instructions to deploy Video Mate on a **Hetzner Cloud CX43** server. This server was chosen for its excellent price/performance ratio (8 vCPUs, 16GB RAM) which is critical for handling the AI models without crashing.
 
 ## Prerequisites
 
@@ -43,9 +43,9 @@ Before renting a server, you can simulate the entire deployment on your local Ma
 3.  Click **Add Server**:
     *   **Location**: Choose `Falkenstein` or `Nuremberg` (often cheapest) or `Ashburn, VA` (if you are in the US).
     *   **Image**: Choose **Ubuntu 22.04**.
-    *   **Type**: Select **Shared vCPU (x86)** -> **CPX41**.
-        *   *Specs: 8 vCPUs, 16 GB RAM, 240 GB Disk.*
-        *   *Cost: ~€28/month (hourly billing).*
+    *   **Type**: Select **Standard (Intel/AMD)** -> **CX43**.
+        *   *Specs: 8 vCPUs, 16 GB RAM.*
+        *   *Cost: ~€9.49/month (hourly billing).*
     *   **Networking**: Keep default (IPv4 + IPv6).
     *   **SSH Keys**:
         *   If you don't have one, click "Add SSH Key", upload your public key (usually `~/.ssh/id_rsa.pub` on Mac).
