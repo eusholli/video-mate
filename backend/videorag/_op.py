@@ -657,6 +657,41 @@ async def _retrieve_and_filter_segments(
     
     # Consolidate and Deduplicate
     all_retrieved_objects = text_segment_objects + entity_retrieved_objects + visual_retrieved_objects
+    
+    # LLM-based Intent Classification
+    import os
+    import json
+    from videorag._llm import gpt_complete
+    
+    async def classify_query_intent(query, global_config):
+        try:
+            model_name = os.environ.get("PROCESSING_MODEL", "gpt-4o-mini")
+            prompt = f"""Analyze the user's video search query: "{query}"
+            
+            Determine if the user is primarily asking for:
+            1. "visual": Visual content, descriptions of scenes, appearance, or actions (e.g. "describe the scene", "what is he wearing", "show me").
+            2. "text": Spoken content, quotes, or specific information mentioned in speech (e.g. "what did he say about X", "quote regarding Y").
+            3. "mixed": Both or unclear.
+            
+            Return ONLY a valid JSON object: {{"intent": "visual" | "text" | "mixed"}}"""
+            
+            response = await gpt_complete(model_name, prompt, global_config=global_config)
+            # Simple cleanup for JSON
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0].strip()
+            elif "```" in response: # Generic code block
+                 response = response.split("```")[1].split("```")[0].strip()
+                 
+            data = json.loads(response)
+            return data.get("intent", "mixed")
+        except Exception as e:
+            print(f"Intent classification failed: {e}")
+            return "mixed"
+
+    intent = await classify_query_intent(query, global_config)
+    print(f"Query Intent Classified: {intent}")
+    is_visual_intent = (intent == "visual")
+    
     unique_segments = {}
     for obj in all_retrieved_objects:
         sid = obj["id"]
@@ -665,9 +700,18 @@ async def _retrieve_and_filter_segments(
         else:
             existing = unique_segments[sid]
             if obj["type"] == "visual":
+                # Prioritize existing text/entity matches over visual UNLESS it's a visual intent query
+                if not is_visual_intent and existing["type"] in ["text", "entity"]:
+                    continue
                 unique_segments[sid] = obj
             elif obj["type"] == existing["type"] and obj["score"] > existing["score"]:
                 unique_segments[sid] = obj
+                
+    # STRICT FILTERING for Visual Intent
+    if is_visual_intent:
+        # Filter out anything that is NOT type="visual"
+        # This removes text/entity matches that didn't have a corresponding visual match found/overwritten.
+        unique_segments = {k: v for k, v in unique_segments.items() if v['type'] == 'visual'}
                 
     retrieved_segments = list(unique_segments.values())
     
@@ -764,7 +808,10 @@ async def videorag_query(
             end_time = eval(time_str.split('-')[1])
 
             # Try to refine with detailed transcript (Word-level precision)
-            if "detailed_transcript" in segment_data:
+            # SKIP if it is a visual match (play full segment)
+            is_visual = segments_map.get(s_id, {}).get("type") == "visual"
+            
+            if "detailed_transcript" in segment_data and not is_visual:
                 dt = segment_data["detailed_transcript"]
                 # dt has "sentences" or "words" with "start" in ms
                 if isinstance(dt, dict):

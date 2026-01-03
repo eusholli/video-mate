@@ -136,8 +136,31 @@ export function ResearchChat({ sessionId, onSourceClick }: ResearchChatProps) {
                             {m.sources && m.sources.length > 0 && (
                                 <div className="mt-4 flex flex-col gap-3 w-full max-w-[85%] animate-in fade-in slide-in-from-bottom-2">
                                     {m.sources.map((src: any, j: number) => {
-                                        // Clean text content
-                                        const content = src.content || "";
+                                        // Clean and formatting text content
+                                        const cleanSourceContent = (text: string) => {
+                                            if (!text) return "";
+                                            let cleaned = text;
+
+                                            // 1. Headers: "#Title" -> "# Title"
+                                            cleaned = cleaned.replace(/(^|\n)(#{1,6})([^\s#])/g, '$1$2 $3');
+
+                                            // 2. Blockquotes: ">Text" -> "> Text"
+                                            cleaned = cleaned.replace(/(^|\n)(>)([^\s])/g, '$1$2 $3');
+
+                                            // 3. Unordered Lists: "-Item" -> "- Item" (avoiding * to protect italics)
+                                            cleaned = cleaned.replace(/(^|\n)([-])([^\s-])/g, '$1$2 $3');
+
+                                            // 4. Ordered Lists: "1.Item" -> "1. Item" (avoiding digits to protect decimals)
+                                            cleaned = cleaned.replace(/(^|\n)(\d+\.)([^\s\d])/g, '$1$2 $3');
+
+                                            // 5. Bold/Italic: "**Text**Next" -> "**Text** Next"
+                                            // Ensure space after closing delimiter (*, **, ***) if followed by alphanumeric
+                                            // Matches: (Non-space/star) + (Stars) + (Alphanumeric)
+                                            cleaned = cleaned.replace(/([^\s*])(\*{1,3})([a-zA-Z0-9])/g, '$1$2 $3');
+
+                                            return cleaned;
+                                        };
+                                        const content = cleanSourceContent(src.content);
 
                                         // Format timestamps
                                         const formatTime = (seconds: number) => {
@@ -171,8 +194,8 @@ export function ResearchChat({ sessionId, onSourceClick }: ResearchChatProps) {
                                                     )}
                                                 </div>
 
-                                                <div className="text-foreground/90 leading-relaxed whitespace-pre-wrap font-serif text-[0.95rem]">
-                                                    "{content}"
+                                                <div className="text-foreground/90 leading-relaxed font-serif text-[0.95rem] prose dark:prose-invert max-w-none [&>p]:my-0">
+                                                    <ReactMarkdown>{content}</ReactMarkdown>
                                                 </div>
 
                                                 <div className="mt-2 text-xs text-primary/0 group-hover:text-primary/100 transition-colors font-medium flex items-center justify-end gap-1">

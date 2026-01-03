@@ -615,7 +615,7 @@ def query_worker_process(session_id, query, global_config, server_url):
         # Resolve video_ids for sources
         try:
             lm = get_library_manager()
-            videos = lm.get_videos()
+            videos = lm.list_videos()
             # RAG uses filename stem as video_name, which matches default title
             # RAG uses filename stem as video_name.
             # In our case, video_name often equals the video_id (MD5 hash).
