@@ -582,20 +582,45 @@ def query_worker_process(session_id, query, global_config, server_url):
         param = QueryParam(mode="videorag")
         param.wo_reference = True
         response = rag.query(query=query, param=param)
+        if isinstance(response, tuple):
+            response_text, sources = response
+        else:
+            response_text = response
+            sources = []
         
+        # Sanitize for JSON
+        def make_serializable(obj):
+            import numpy as np
+            if isinstance(obj, np.floating):
+                v = float(obj)
+                if np.isnan(v) or np.isinf(v): return None
+                return v
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.ndarray):
+                return make_serializable(obj.tolist())
+            if isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [make_serializable(i) for i in obj]
+            return obj
+
+        sources = make_serializable(sources)
+
         # History Handling
         history_file = os.path.join(session_dir, "history.json")
         history = ensure_json_file(history_file, [])
         history.append({
             "role": "assistant", 
-            "content": response, 
+            "content": response_text, 
+            "sources": sources,
             "timestamp": datetime.datetime.now().isoformat()
         })
         save_json_file(history_file, history)
         
         # Update Status
         status_file = os.path.join(session_dir, "status.json")
-        res = {"query_status": {"status": "completed", "answer": response, "query": query}}
+        res = {"query_status": {"status": "completed", "answer": response_text, "sources": sources, "query": query}}
         save_json_file(status_file, res)
         
         # Update Session Last Active
@@ -674,8 +699,8 @@ def clip_generator_worker(session_id, query, global_config, server_url):
                 if not success: continue
             
             # Add URL
-            # URL: /api/library/videos/<vid>/clips/<output_name>
-            clip["url"] = f"{server_url}/api/library/videos/{video_id}/clips/{output_name}"
+            # URL: /api/library/<vid>/clips/<output_name>
+            clip["url"] = f"{server_url}/api/library/{video_id}/clips/{output_name}"
             # Add Title/Thumb?
             clip["title"] = video_entry.get("title", "Video")
             generated_clips.append(clip)
@@ -798,6 +823,140 @@ def create_app():
         
         # Calculate ID
         video_id = calculate_md5(path)
+        title = os.path.basename(path)
+        
+        # Create entry in library (this ensures it shows up in the UI)
+        lm.add_video_entry(video_id, title, path)
+        
+        success, msg, global_config = load_and_init_global_config()
+        
+        # Start worker
+        # We need to determine the server URL for the worker to call back (ImageBind)
+        # We'll use local loopback on the port we know we are running on (64451 from logs)
+        server_url = "http://127.0.0.1:64451"
+        
+        p = multiprocessing.Process(target=ingest_worker_process, args=(video_id, path, global_config, server_url, resume))
+        p.start()
+        
+        return jsonify({"success": True, "video_id": video_id, "message": "Ingestion started"})
+
+    @app.route("/api/library/<video_id>/clips/<filename>", methods=["GET"])
+    def get_generated_clip(video_id, filename):
+        lm = get_library_manager()
+        clip_path = os.path.join(lm.library_dir, video_id, "clips", filename)
+        if os.path.exists(clip_path):
+            return send_file(clip_path)
+        return jsonify({"success": False, "error": "Clip not found"}), 404
+
+    @app.route("/api/library/<video_id>/transcript", methods=["GET"])
+    def get_transcript(video_id):
+        lm = get_library_manager()
+        video_entry = lm.get_video(video_id)
+        if not video_entry:
+            return jsonify({"success": False, "error": "Video not found"}), 404
+        
+        # Access KV Store directly
+        kv_path = os.path.join(lm.library_dir, video_id, "kv_store_video_segments.json")
+        if not os.path.exists(kv_path):
+             return jsonify({"success": False, "error": "Transcript not available"}), 404
+             
+        try:
+            with open(kv_path, 'r') as f:
+                segments_data = json.load(f)
+            
+            # Handle nested structure {video_id: {index: data}} vs flat {video_id_index: data}
+            target_segments = {}
+            if video_id in segments_data:
+                target_segments = segments_data[video_id]
+            else:
+                target_segments = segments_data
+
+            sorted_segments = []
+            for key, val in target_segments.items():
+                try:
+                    # Key could be "0" (nested) or "vid_0" (flat)
+                    if "_" in key:
+                         if not key.startswith(video_id): continue
+                         idx = int(key.split("_")[-1])
+                    else:
+                         idx = int(key)
+
+                    val["id"] = f"{video_id}_{idx}" # Normalizing ID
+                    val["index"] = idx
+                    
+                    # Parse time string "start-end"
+                    if "time" in val:
+                        start, end = val["time"].split("-")
+                        val["start_time"] = float(start)
+                        val["end_time"] = float(end)
+                    elif "start" in val and "end" in val:
+                        # Sometimes it might be pre-parsed?
+                         val["start_time"] = float(val["start"])
+                         val["end_time"] = float(val["end"])
+                    
+                    # Fix Relative Timestamps in sentences
+                    # The 'sentences' generated by the tool are often relative to the chunk start
+                    if "detailed_transcript" in val:
+                        dt = val["detailed_transcript"]
+                        offset_ms = val["start_time"] * 1000
+                        
+                        if "sentences" in dt:
+                            for s in dt["sentences"]:
+                                s["start"] = s["start"] + offset_ms
+                                s["end"] = s["end"] + offset_ms
+                                
+                        if "words" in dt:
+                            for w in dt["words"]:
+                                w["start"] = w["start"] + offset_ms
+                                w["end"] = w["end"] + offset_ms
+
+                    sorted_segments.append(val)
+                except: continue
+                
+            sorted_segments.sort(key=lambda x: x["index"])
+            return jsonify({"success": True, "transcript": sorted_segments})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    @app.route("/api/clip/generate_exact", methods=["POST"])
+    def generate_exact_clip():
+        data = request.json
+        video_id = data.get("video_id")
+        start = data.get("start")
+        end = data.get("end")
+        
+        if not video_id or start is None or end is None:
+             return jsonify({"success": False, "error": "Missing parameters"}), 400
+             
+        lm = get_library_manager()
+        video_entry = lm.get_video(video_id)
+        if not video_entry:
+            return jsonify({"success": False, "error": "Video not found"}), 404
+            
+        original_path = video_entry.get("original_path")
+        if not original_path or not os.path.exists(original_path):
+             # Try working dir fallback?
+             working_path = os.path.join(lm.library_dir, video_id, f"{video_id}{os.path.splitext(original_path or '')[1]}")
+             if os.path.exists(working_path):
+                 original_path = working_path
+             else:
+                 return jsonify({"success": False, "error": "Source file not found"}), 404
+
+        # Generate output path
+        clips_dir = os.path.join(lm.library_dir, video_id, "clips")
+        os.makedirs(clips_dir, exist_ok=True)
+        filename = f"exact_{int(start*1000)}_{int(end*1000)}.mp4"
+        output_path = os.path.join(clips_dir, filename)
+        
+        # Check cache
+        if not os.path.exists(output_path):
+            success = generate_clip_file(original_path, start, end, output_path)
+            if not success:
+               return jsonify({"success": False, "error": "Generation failed"}), 500
+               
+        url = f"/api/library/{video_id}/clips/{filename}"
+        return jsonify({"success": True, "url": url})
+
         filename = os.path.basename(path)
         
         # Add to Library (or get existing)
@@ -890,11 +1049,7 @@ def create_app():
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 
-    @app.route("/api/library/videos/<video_id>/clips/<filename>", methods=["GET"])
-    def serve_clip_file(video_id, filename):
-        lm = get_library_manager()
-        clips_dir = os.path.join(lm.library_dir, video_id, "clips")
-        return send_file(os.path.join(clips_dir, filename))
+
 
     # --- Session Endpoints ---
     @app.route("/api/sessions", methods=["GET"])

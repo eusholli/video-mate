@@ -48,6 +48,9 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
             subprocess.run(cmd, check=True)
             
             # Use temp file for recognition
+            if model == "whisper-1" or model == "openai-whisper":
+                return await transcribe_segment_with_whisper(index, temp_audio, segment_name, api_json_file)
+
             recognition = Recognition(
                 model=model,
                 format="mp3", # We converted to mp3
@@ -65,8 +68,8 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
             logger.error(f"ASR failed for segment {segment_name}: {e}")
             result = None
         finally:
-             if os.path.exists(temp_audio):
-                 os.remove(temp_audio)
+            if os.path.exists(temp_audio):
+                os.remove(temp_audio)
 
         if result and result.status_code == 200:
             # Extract text and sentences from result
@@ -101,13 +104,79 @@ async def process_single_segment(semaphore, index, segment_name, audio_file, mod
                 with open(api_json_file, 'w', encoding='utf-8') as f:
                     json.dump(response_json, f, ensure_ascii=False, indent=2)
             except Exception as e:
-                 logger.error(f"Failed to save JSON cache: {e}")
+                logger.error(f"Failed to save JSON cache: {e}")
                  
             return index, response_json
         else:
             msg = result.message if result else "Unknown error"
             logger.error(f"ASR Task failed for segment {segment_name}: {msg}")
             return index, {"text": "", "sentences": []}
+
+async def transcribe_segment_with_whisper(index, audio_file, segment_name, api_json_file):
+    from openai import AsyncOpenAI
+    import json
+    
+    # Get API key from env (it should be loaded)
+    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    
+    if not api_key:
+        logger.error(f"OpenAI API Key missing for Whisper")
+        return index, {"text": "", "sentences": [], "words": []}
+
+    try:
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        
+        with open(audio_file, "rb") as af:
+            response = await client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=af, 
+                language="en",
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"]
+            )
+            
+        data = response.to_dict()
+        
+        # Parse output
+        full_text = data.get("text", "")
+        
+        # Map Segments -> Sentences
+        sentences = []
+        for seg in data.get("segments", []):
+            sentences.append({
+                "text": seg["text"],
+                "start": int(seg["start"] * 1000), # s to ms
+                "end": int(seg["end"] * 1000)
+            })
+            
+        # Map Words
+        words = []
+        for w in data.get("words", []):
+            words.append({
+                "text": w["word"],
+                "start": int(w["start"] * 1000),
+                "end": int(w["end"] * 1000)
+            })
+            
+        response_json = {
+            "text": full_text,
+            "sentences": sentences,
+            "words": words
+        }
+        
+        # Cache logic
+        try:
+            with open(api_json_file, 'w', encoding='utf-8') as f:
+                json.dump(response_json, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save JSON cache: {e}")
+        
+        return index, response_json
+
+    except Exception as e:
+        logger.error(f"Whisper failed for {segment_name}: {e}")
+        return index, {"text": "", "sentences": [], "words": []}
 
 async def speech_to_text_online(video_name, working_dir, segment_index2name, audio_output_format, global_config, max_concurrent=5):
     """

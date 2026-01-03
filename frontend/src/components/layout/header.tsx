@@ -23,7 +23,12 @@ export function Header() {
                         >
                             Dashboard
                         </Link>
-
+                        <Link
+                            href="/researcher"
+                            className={cn("transition-colors hover:text-foreground/80", pathname.startsWith("/researcher") ? "text-foreground" : "text-foreground/60")}
+                        >
+                            Researcher
+                        </Link>
                     </nav>
                 </div>
 

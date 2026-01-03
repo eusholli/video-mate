@@ -774,7 +774,10 @@ async def videorag_query(
         system_prompt=sys_prompt,
         global_config=global_config,
     )
-    return response
+    
+    # Return both response and sources
+    # Sources are 'remain_segments' which contain metadata
+    return response, remain_segments
 
 
 async def search_precise_clips(

@@ -76,6 +76,12 @@ export const api = {
     async deleteVideo(id: string): Promise<{ success: boolean }> {
         return this.delete(`/api/library/${id}`);
     },
+    async getTranscript(id: string): Promise<{ success: boolean; transcript: TranscriptSegment[] }> {
+        return this.get(`/api/library/${id}/transcript`);
+    },
+    async generateExactClip(video_id: string, start: number, end: number): Promise<{ success: boolean; url: string }> {
+        return this.post("/api/clip/generate_exact", { video_id, start, end });
+    },
 
     // --- Sessions ---
     async getSessions(): Promise<{ success: boolean; sessions: ChatSession[] }> {
@@ -124,4 +130,13 @@ export interface ChatSession {
     video_ids: string[];
     created_at: number;
     last_active: number;
+}
+
+export interface TranscriptSegment {
+    id: string;
+    index: number;
+    text: string;
+    start_time: number;
+    end_time: number;
+    detailed_transcript?: { [key: string]: any }; // simplified
 }
