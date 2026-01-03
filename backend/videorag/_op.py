@@ -744,18 +744,53 @@ async def videorag_query(
         global_config=global_config,
     )
 
-    # 3. Form Context
+    # 3. Form Context and Enrich Sources
     text_units_section_list = [["video_name", "start_time", "end_time", "content"]]
+    
+    # Create a lookup map for remain_segments to update them
+    segments_map = {seg["id"]: seg for seg in remain_segments}
+
     for s_id in caption_results:
         video_name = '_'.join(s_id.split('_')[:-1])
         index = s_id.split('_')[-1]
         try:
-            time_str = video_segments._data[video_name][index]["time"]
-            start_time = eval(time_str.split('-')[0])
+            segment_data = video_segments._data[video_name][index]
+            time_str = segment_data["time"]
+            segment_start_abs = eval(time_str.split('-')[0])
+            # segment_end_abs = eval(time_str.split('-')[1]) # Not strictly needed if we use duration
+            
+            # Default to segment bounds
+            start_time = segment_start_abs
             end_time = eval(time_str.split('-')[1])
-            start_fmt = f"{start_time // 3600}:{(start_time % 3600) // 60}:{start_time % 60}"
-            end_fmt = f"{end_time // 3600}:{(end_time % 3600) // 60}:{end_time % 60}"
+
+            # Try to refine with detailed transcript (Word-level precision)
+            if "detailed_transcript" in segment_data:
+                dt = segment_data["detailed_transcript"]
+                # dt has "sentences" or "words" with "start" in ms
+                if isinstance(dt, dict):
+                    sentences = dt.get("sentences", [])
+                    if not sentences and "words" in dt:
+                         sentences = dt.get("words", []) # Fallback to words if no sentences
+                    
+                    if sentences:
+                        # Start of first sentence/word (ms)
+                        start_offset_ms = sentences[0].get("start", 0)
+                        # End of last sentence/word (ms)
+                        end_offset_ms = sentences[-1].get("end", 0)
+                        
+                        start_time = segment_start_abs + (start_offset_ms / 1000.0)
+                        end_time = segment_start_abs + (end_offset_ms / 1000.0)
+            
+            start_fmt = f"{int(start_time) // 3600}:{(int(start_time) % 3600) // 60}:{int(start_time) % 60}"
+            end_fmt = f"{int(end_time) // 3600}:{(int(end_time) % 3600) // 60}:{int(end_time) % 60}"
             text_units_section_list.append([video_name, start_fmt, end_fmt, caption_results[s_id]])
+            
+            # Enrich the source object
+            if s_id in segments_map:
+                segments_map[s_id]["video_name"] = video_name
+                segments_map[s_id]["start"] = float(start_time)
+                segments_map[s_id]["end"] = float(end_time)
+                segments_map[s_id]["content"] = caption_results[s_id] 
         except: continue
         
     text_units_context = list_of_list_to_csv(text_units_section_list)

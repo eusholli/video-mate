@@ -330,6 +330,7 @@ class SessionManager:
 global_imagebind_manager = GlobalImageBindManager()
 library_manager = None
 session_manager = None
+global_config = None
 
 def get_library_manager():
     global library_manager
@@ -603,9 +604,42 @@ def query_worker_process(session_id, query, global_config, server_url):
                 return {k: make_serializable(v) for k, v in obj.items()}
             if isinstance(obj, list):
                 return [make_serializable(i) for i in obj]
+            if hasattr(obj, "to_dict"):
+                return make_serializable(obj.to_dict())
+            if hasattr(obj, "__dict__"):
+                return make_serializable(obj.__dict__)
             return obj
 
         sources = make_serializable(sources)
+        
+        # Resolve video_ids for sources
+        try:
+            lm = get_library_manager()
+            videos = lm.get_videos()
+            # RAG uses filename stem as video_name, which matches default title
+            # RAG uses filename stem as video_name.
+            # In our case, video_name often equals the video_id (MD5 hash).
+            name_to_id = {v['title']: v['id'] for v in videos}
+            valid_ids = {v['id'] for v in videos}
+            
+            for s in sources:
+                if isinstance(s, dict) and "video_name" in s:
+                    vn = s["video_name"]
+                    
+                    # 1. Direct match with ID (most likely)
+                    if vn in valid_ids:
+                         s["video_id"] = vn
+                    # 2. Match with Title
+                    elif vn in name_to_id:
+                        s["video_id"] = name_to_id[vn]
+                    else:
+                        # 3. Fallback: try case-insensitive title match
+                        for k, v_id in name_to_id.items():
+                            if k.lower() == vn.lower():
+                                s["video_id"] = v_id
+                                break
+        except Exception as e:
+            print(f"Error resolving source video_ids: {e}")
 
         # History Handling
         history_file = os.path.join(session_dir, "history.json")
@@ -794,10 +828,102 @@ def create_app():
     CORS(app)
     
     # Load config on startup
-    load_and_init_global_config()
+    global global_config
+    _, _, global_config = load_and_init_global_config()
+    
+    # --- NEW ENDPOINTS ---
+    
 
-    @app.route("/api/health", methods=["GET"])
-    def health_check():
+    @app.route("/api/library/<video_id>/clip", methods=["POST"])
+    def generate_manual_clip(video_id):
+        """Generate a clip from start to end timestamp manually"""
+        try:
+            data = request.json
+            start = data.get("start")
+            end = data.get("end")
+            
+            if start is None or end is None:
+                return jsonify({"success": False, "error": "Missing start/end"}), 400
+                
+            lib_mgr = get_library_manager()
+            video_entry = lib_mgr.get_video(video_id)
+            if not video_entry:
+                return jsonify({"success": False, "error": "Video not found"}), 404
+                
+            # Output path
+            clips_dir = os.path.join(lib_mgr.library_dir, video_id, "clips")
+            os.makedirs(clips_dir, exist_ok=True)
+            output_name = f"manual_{int(start*1000)}_{int(end*1000)}.mp4"
+            output_path = os.path.join(clips_dir, output_name)
+            
+            # Check if exists
+            if not os.path.exists(output_path):
+                 success = generate_clip_file(video_entry["original_path"], start, end, output_path)
+                 if not success:
+                     return jsonify({"success": False, "error": "Clip generation failed"}), 500
+                     
+            server_url = f"http://localhost:{globals().get('SERVER_PORT', 64451)}"
+            url = f"{server_url}/api/library/{video_id}/clips/{output_name}"
+            return jsonify({
+                "success": True, 
+                "clip": {
+                    "url": url,
+                    "start": start,
+                    "end": end,
+                    "title": video_entry.get("title", "Video"),
+                    "video_id": video_id
+                }
+            })
+
+        except Exception as e:
+            log_to_file(f"Manual clip generation failed: {e}")
+            return jsonify({"success": False, "error": str(e)}), 500
+            
+    # --- END NEW ENDPOINTS ---
+
+
+    @app.route("/api/library/<video_id>/stream", methods=["GET"])
+    def stream_video(video_id):
+        """Stream the video file"""
+        try:
+            lib_mgr = get_library_manager()
+            video_entry = lib_mgr.get_video(video_id)
+            if not video_entry:
+                return jsonify({"success": False, "error": "Video not found"}), 404
+            
+            # Prefer using the file in working_dir (copied during ingest) to ensure existence?
+            # Or original path?
+            # Original path might reference temp upload which might be gone?
+            # Ingest copies it to working_dir/<id>.ext
+            
+            working_dir = os.path.join(lib_mgr.library_dir, video_id)
+            # Find video file in working_dir
+            # It should be <video_id>.* 
+            
+            target_file = None
+            if os.path.exists(working_dir):
+                for f in os.listdir(working_dir):
+                    if f.startswith(video_id + "."):
+                        target_file = os.path.join(working_dir, f)
+                        break
+            
+            if not target_file:
+                # Fallback to original path
+                 if os.path.exists(video_entry["original_path"]):
+                     target_file = video_entry["original_path"]
+            
+            if not target_file or not os.path.exists(target_file):
+                return jsonify({"success": False, "error": "Video file not found"}), 404
+                
+            return send_file(target_file) 
+            # Note: For production streaming, need range support. 
+            # Flask send_file supports it basically, but for large files it's not ideal.
+            # But for this prototype, it's sufficient.
+            
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+            
+
         return jsonify({"status": "ok"})
         
     @app.route("/api/initialize", methods=["POST"])
@@ -806,6 +932,11 @@ def create_app():
         return jsonify({"success": s, "message": m})
 
     # --- Library Endpoints ---
+    @app.route("/api/health", methods=["GET"])
+    def health_check():
+        lm = get_library_manager()
+        return jsonify({"success": True, "videos": lm.list_videos()})
+        
     @app.route("/api/library", methods=["GET"])
     def list_library():
         lm = get_library_manager()
@@ -845,7 +976,7 @@ def create_app():
         lm = get_library_manager()
         clip_path = os.path.join(lm.library_dir, video_id, "clips", filename)
         if os.path.exists(clip_path):
-            return send_file(clip_path)
+            return send_file(clip_path, as_attachment=True, download_name=filename)
         return jsonify({"success": False, "error": "Clip not found"}), 404
 
     @app.route("/api/library/<video_id>/transcript", methods=["GET"])
@@ -914,7 +1045,54 @@ def create_app():
                 except: continue
                 
             sorted_segments.sort(key=lambda x: x["index"])
-            return jsonify({"success": True, "transcript": sorted_segments})
+            
+            # Flatten to sentences for frontend
+            full_transcript = []
+            for seg in sorted_segments:
+                if "detailed_transcript" in seg and "sentences" in seg["detailed_transcript"]:
+                    # Already offset-adjusted above
+                    # Ensure words are propagated if strictly needed by frontend, usually they are attached to sentences?
+                    # In videorag 'sentences' might strictly contain text/start/end.
+                    # 'words' are usually a separate list in detailed_transcript or attached to sentences?
+                    # Let's check how 'offset_ms' logic was applied.
+                    # It iterated `dt["sentences"]` AND `dt["words"]`.
+                    # So `words` is a sibling of `sentences` in `detailed_transcript`.
+                    # We should probably return a structure that supports both.
+                    # But the frontend loop iterates `sentences`.
+                    # We should attach the relevant words TO the sentence?
+                    # Or just return a flat list of sentences, and each sentence has a `words` property?
+                    # The current logic extends `full_transcript` with `dt["sentences"]`.
+                    # If `dt["sentences"]` items don't have `words`, we lose them.
+                    
+                    # Heuristic: Filter main `dt["words"]` into these sentences based on time range?
+                    # This is expensive. 
+                    # Does the ASR tool output words *inside* sentences?
+                    # Dashscope/Whisper outputs might differ.
+                    # If we look at lines 1005-1008:
+                    # if "words" in dt: for w in dt["words"]: adjust...
+                    
+                    # So `words` are in `dt`.
+                    # We need to assign them to sentences.
+                    sentences = seg["detailed_transcript"]["sentences"]
+                    words = seg["detailed_transcript"].get("words", [])
+                    
+                    for s in sentences:
+                        s_start = s["start"]
+                        s_end = s["end"]
+                        # Find words in this range
+                        s["words"] = [w for w in words if w["start"] >= s_start and w["end"] <= s_end]
+                        
+                    full_transcript.extend(sentences)
+                else:
+                    # Fallback to chunk text
+                    full_transcript.append({
+                        "text": seg.get("text", ""),
+                        "start": seg["start_time"] * 1000,
+                        "end": seg["end_time"] * 1000,
+                        "words": [] # No words available
+                    })
+                    
+            return jsonify({"success": True, "transcript": full_transcript})
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 

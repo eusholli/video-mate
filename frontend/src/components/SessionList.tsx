@@ -126,10 +126,10 @@ export function SessionList() {
         <Card className="h-full flex flex-col">
             <CardHeader className="flex flex-row items-center justify-between">
                 <div>
-                    <CardTitle>Sessions</CardTitle>
-                    <CardDescription>Access previous chats.</CardDescription>
+                    <CardTitle>Workspaces</CardTitle>
+                    <CardDescription>Resume your analysis projects.</CardDescription>
                 </div>
-                <Button size="sm" onClick={openCreateMode}>+ New Session</Button>
+                <Button size="sm" onClick={openCreateMode}>+ New Workspace</Button>
             </CardHeader>
             <CardContent className="flex-1 overflow-y-auto space-y-2 pr-2">
                 {loading && <div className="text-center text-sm p-4">Loading...</div>}

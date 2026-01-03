@@ -1,17 +1,16 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { api, ChatSession } from "@/lib/api";
+import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Loader2, ArrowRight, PlayCircle } from "lucide-react";
+import { Loader2, ArrowRight } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import Link from "next/link";
 
 interface ResearchChatProps {
-    selectedIds: string[];
+    sessionId: string;
+    onSourceClick?: (source: any) => void;
 }
 
 interface Message {
@@ -20,131 +19,89 @@ interface Message {
     sources?: any[];
 }
 
-export function ResearchChat({ selectedIds }: ResearchChatProps) {
+export function ResearchChat({ sessionId, onSourceClick }: ResearchChatProps) {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
-    const [sessionId, setSessionId] = useState<string | null>(null);
-    const [activeIds, setActiveIds] = useState<string[]>([]); // Ids current session is built on
+
+    // Poll for updates (e.g. if clips are generated elsewhere or just to keep sync)
+    // For now, valid syncing on load and after send
 
     const scrollRef = useRef<HTMLDivElement>(null);
-    const idsKey = [...selectedIds].sort().join(",");
+    const prevLengthRef = useRef(0);
+    const lastHistoryStrRef = useRef("");
 
-    // Auto-scroll
+    // Auto-scroll only when message count increases
     useEffect(() => {
-        if (scrollRef.current) {
-            scrollRef.current.scrollIntoView({ behavior: "smooth" });
+        if (messages.length > prevLengthRef.current) {
+            if (scrollRef.current) {
+                scrollRef.current.scrollIntoView({ behavior: "smooth" });
+            }
         }
+        prevLengthRef.current = messages.length;
     }, [messages]);
 
-    // Restore Session
-    useEffect(() => {
-        if (!idsKey) {
-            setMessages([]);
-            setSessionId(null);
-            return;
-        }
+    const loadHistory = async () => {
+        if (!sessionId) return;
+        try {
+            const res = await api.getSession(sessionId);
+            if (res.success) {
+                const newMessages = res.history.map((h: any) => ({
+                    role: h.role,
+                    content: h.content,
+                    sources: h.sources
+                }));
 
-        const cachedSessionId = sessionStorage.getItem(`research_session_${idsKey}`);
-        if (cachedSessionId) {
-            if (cachedSessionId === sessionId) return; // Already loaded
+                const newStr = JSON.stringify(newMessages);
+                if (newStr !== lastHistoryStrRef.current) {
+                    setMessages(newMessages);
+                    lastHistoryStrRef.current = newStr;
 
-            setLoading(true);
-            api.getSession(cachedSessionId).then(res => {
-                if (res.success) {
-                    setSessionId(cachedSessionId);
-                    setActiveIds(selectedIds);
-                    setMessages(res.history.map((h: any) => ({
-                        role: h.role,
-                        content: h.content,
-                        sources: h.sources
-                    })));
-                } else {
-                    // Invalid
-                    sessionStorage.removeItem(`research_session_${idsKey}`);
-                    setSessionId(null);
-                    setMessages([]);
+                    // Stop loading if the last message is from the assistant
+                    if (newMessages.length > 0 && newMessages[newMessages.length - 1].role === "assistant") {
+                        setLoading(false);
+                    }
                 }
-            }).catch(() => {
-                sessionStorage.removeItem(`research_session_${idsKey}`);
-                setSessionId(null);
-                setMessages([]);
-            }).finally(() => setLoading(false));
-        } else {
-            // Reset if no cached session for this selection
-            setSessionId(null);
-            setMessages([]);
+            }
+        } catch (e) {
+            console.error("Failed to load history", e);
         }
-    }, [idsKey]);
+    };
+
+    // Initial Load & Poll
+    useEffect(() => {
+        // Reset refs on session change
+        prevLengthRef.current = 0;
+        lastHistoryStrRef.current = "";
+
+        loadHistory();
+        const interval = setInterval(loadHistory, 3000); // Poll every 3s
+        return () => clearInterval(interval);
+    }, [sessionId]);
+
 
     const handleSend = async () => {
         if (!input.trim()) return;
-        if (selectedIds.length === 0) {
-            alert("Please select at least one source video.");
-            return;
-        }
 
         const userMsg = input;
         setInput("");
+        // Optimistic update
         setMessages(prev => [...prev, { role: "user", content: userMsg }]);
         setLoading(true);
 
         try {
-            let currentSessionId = sessionId;
+            await api.querySession(sessionId, userMsg);
 
-            // Create new session if selection changed or no session
-            // naive check: string sort comparison
-            const selectionChanged = JSON.stringify([...selectedIds].sort()) !== JSON.stringify([...activeIds].sort());
+            // Trigger immediate reload check
+            setTimeout(loadHistory, 500);
 
-            if (!currentSessionId || selectionChanged) {
-                const sessionRes = await api.createSession("Research Session", selectedIds);
-                currentSessionId = sessionRes.session.id;
-                setSessionId(currentSessionId);
-                setActiveIds(selectedIds);
-
-                // Cache ID
-                const key = [...selectedIds].sort().join(",");
-                sessionStorage.setItem(`research_session_${key}`, currentSessionId);
-            }
-
-            // Send Query
-            await api.querySession(currentSessionId!, userMsg);
-
-            // Poll for status
-            const poll = setInterval(async () => {
-                try {
-                    const statusRes = await api.getSessionStatus(currentSessionId!);
-                    // Handle both nested and flat structure (robustness)
-                    const qs = statusRes.status.query_status || (statusRes.status.status ? statusRes.status : null);
-
-                    if (qs && qs.status === "completed") {
-                        clearInterval(poll);
-                        setMessages(prev => [...prev, {
-                            role: "assistant",
-                            content: qs.answer,
-                            sources: qs.sources
-                        }]);
-                        setLoading(false);
-                    } else if (qs && qs.status === "error") {
-                        clearInterval(poll);
-                        setMessages(prev => [...prev, { role: "assistant", content: `Error: ${qs.message}` }]);
-                        setLoading(false);
-                    }
-                } catch (e) {
-                    // Don't clear on temporary network error, but if many fail?
-                    console.error("Poll error", e);
-                    // For now, if we fail to parse, it might be the NaN issue or similar
-                    // We should probably stop
-                    clearInterval(poll);
-                    setMessages(prev => [...prev, { role: "assistant", content: `Error: Failed to retrieve answer (Backend might be sending invalid data)` }]);
-                    setLoading(false);
-                }
-            }, 1000);
+            // Note: We DO NOT set loading(false) here. 
+            // We wait for the poller (loadHistory) to find the assistant's response.
 
         } catch (err: any) {
             console.error(err);
             setMessages(prev => [...prev, { role: "assistant", content: `Failed: ${err.message}` }]);
-            setLoading(false);
+            setLoading(false); // Only stop loading on error
         }
     };
 
@@ -154,8 +111,8 @@ export function ResearchChat({ selectedIds }: ResearchChatProps) {
                 <div className="space-y-6 max-w-4xl mx-auto">
                     {messages.length === 0 && (
                         <div className="text-center text-muted-foreground my-20">
-                            <h3 className="text-2xl font-semibold mb-2">Research Assistant</h3>
-                            <p>Select videos on the left and ask questions to analyze them.</p>
+                            <h3 className="text-xl font-semibold mb-2">Workspace Assistant</h3>
+                            <p>Ask questions about the videos in this workspace.</p>
                         </div>
                     )}
 
@@ -165,7 +122,10 @@ export function ResearchChat({ selectedIds }: ResearchChatProps) {
                                 ? "bg-primary text-primary-foreground"
                                 : "bg-muted/50 border"
                                 }`}>
-                                <div className="prose dark:prose-invert text-sm max-w-none">
+                                <div className={`prose text-sm max-w-none ${m.role === "user"
+                                    ? "[&_*]:text-primary-foreground"
+                                    : "dark:prose-invert"
+                                    }`}>
                                     <ReactMarkdown>
                                         {m.content}
                                     </ReactMarkdown>
@@ -174,55 +134,53 @@ export function ResearchChat({ selectedIds }: ResearchChatProps) {
 
                             {/* Source Cards */}
                             {m.sources && m.sources.length > 0 && (
-                                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 w-full animate-in fade-in slide-in-from-bottom-2">
+                                <div className="mt-4 flex flex-col gap-3 w-full animate-in fade-in slide-in-from-bottom-2">
                                     {m.sources.map((src: any, j: number) => {
-                                        // Attempt to parse ID to get video ID and timestamp
-                                        // ID format assumption: "video_id_index" or similar?
-                                        // The backend source dict is: {id, type, score}
-                                        // We need the BACKEND to enrich this or we parse it here?
-                                        // _op.py returns `remain_segments`.
-                                        // The ID is key in `video_segments`.
-                                        // `videorag_query` returns raw objects. 
-                                        // The backend update I made didn't enrich them. 
-                                        // But wait, the previous `videorag_query` computed context using `video_name` and `index` derived from `s_id`.
+                                        // Clean text content
+                                        let content = src.content || "";
+                                        // Remove metadata prefixes common in RAG output
+                                        content = content.replace(/Caption:\s*/g, "").replace(/Transcript:\s*/g, "").replace(/\(Transcript Match\)/g, "").trim();
 
-                                        // We need to parse: `video_name_index`. 
-                                        // Problem: "video_name" might contain underscores.
-                                        // But `_op.py` splits by `_` :-/ 
-                                        // Correct logic in `_op.py`: `video_name = '_'.join(s_id.split('_')[:-1])`
-
-                                        // We will do client side parsing or fetch details?
-                                        // For MVP, client side parsing using the same logic.
-
-                                        const parts = src.id.split('_');
-                                        const index = parts[parts.length - 1];
-                                        const videoId = parts.slice(0, -1).join('_');
-
-                                        // Link to Detail Page
-                                        // We use query param ?hl=index to highlight relevant part
-                                        // Or ?t=... if we knew the time.
-                                        // We don't have time here without enriching.
-                                        // But the Detail page can load the transcript and find the index!
+                                        // Format timestamps
+                                        const formatTime = (seconds: number) => {
+                                            if (!seconds && seconds !== 0) return "";
+                                            const m = Math.floor(seconds / 60);
+                                            const s = Math.floor(seconds % 60);
+                                            return `${m}:${s.toString().padStart(2, '0')}`;
+                                        };
+                                        const timeRange = (src.start !== undefined && src.end !== undefined)
+                                            ? `${formatTime(src.start)} - ${formatTime(src.end)}`
+                                            : "";
 
                                         return (
-                                            <Link
+                                            <button
                                                 key={j}
-                                                href={`/researcher/video/${videoId}?segment=${index}`}
-                                                className="group block"
+                                                className="border rounded-lg p-3 text-sm bg-card hover:bg-muted/80 transition-all text-left cursor-pointer active:scale-[0.99] duration-200 shadow-sm group"
+                                                onClick={() => {
+                                                    console.log("Source clicked:", src);
+                                                    if (onSourceClick) onSourceClick(src);
+                                                }}
                                             >
-                                                <div className="border rounded p-3 text-xs bg-background hover:border-primary transition-colors cursor-pointer h-full flex flex-col justify-between">
-                                                    <div>
-                                                        <div className="font-semibold text-primary truncate mb-1">Source {j + 1}</div>
-                                                        <div className="text-muted-foreground line-clamp-2 mb-2">
-                                                            {src.type === "visual" ? "[Visual Match]" : "[Text Match]"}
+                                                <div className="flex items-center justify-between mb-2 pb-2 border-b border-border/50">
+                                                    <div className="font-semibold text-primary flex items-center gap-2">
+                                                        <span className="bg-primary/10 text-primary px-2 py-0.5 rounded text-xs uppercase tracking-wider">Source {j + 1}</span>
+                                                        <span className="text-xs text-muted-foreground font-normal">{src.type === "visual" ? "Visual Match" : "Text Match"}</span>
+                                                    </div>
+                                                    {timeRange && (
+                                                        <div className="text-xs font-mono text-muted-foreground bg-muted px-2 py-1 rounded">
+                                                            {timeRange}
                                                         </div>
-                                                    </div>
-                                                    <div className="flex items-center text-primary opacity-0 group-hover:opacity-100 transition-opacity">
-                                                        <PlayCircle className="w-3 h-3 mr-1" />
-                                                        <span>View Context</span>
-                                                    </div>
+                                                    )}
                                                 </div>
-                                            </Link>
+
+                                                <div className="text-foreground/90 leading-relaxed whitespace-pre-wrap font-serif text-[0.95rem]">
+                                                    "{content}"
+                                                </div>
+
+                                                <div className="mt-2 text-xs text-primary/0 group-hover:text-primary/100 transition-colors font-medium flex items-center justify-end gap-1">
+                                                    Jump to clip <span className="text-lg leading-none">→</span>
+                                                </div>
+                                            </button>
                                         );
                                     })}
                                 </div>
@@ -231,26 +189,29 @@ export function ResearchChat({ selectedIds }: ResearchChatProps) {
                     ))}
 
                     {loading && (
-                        <div className="flex items-center gap-2 text-muted-foreground animate-pulse">
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>Creating answer...</span>
+                        <div className="flex flex-col items-start animate-in fade-in slide-in-from-bottom-2">
+                            <div className="bg-muted/50 border rounded-lg p-4 flex items-center gap-1.5 h-10 w-16">
+                                <span className="block w-1.5 h-1.5 bg-foreground/60 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                                <span className="block w-1.5 h-1.5 bg-foreground/60 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                                <span className="block w-1.5 h-1.5 bg-foreground/60 rounded-full animate-bounce"></span>
+                            </div>
                         </div>
                     )}
                     <div ref={scrollRef} />
                 </div>
             </ScrollArea>
 
-            <div className="p-4 border-t bg-background/50 backdrop-blur">
-                <div className="flex gap-2 max-w-4xl mx-auto">
+            <div className="p-3 border-t bg-background/50 backdrop-blur">
+                <div className="flex gap-2 w-full">
                     <Input
-                        placeholder="Ask a question about the selected videos..."
+                        placeholder="Ask a question..."
                         value={input}
                         onChange={e => setInput(e.target.value)}
                         onKeyDown={e => e.key === "Enter" && handleSend()}
                         disabled={loading}
                         className="bg-background"
                     />
-                    <Button onClick={handleSend} disabled={loading}>
+                    <Button onClick={handleSend} disabled={loading} size="icon">
                         {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
                     </Button>
                 </div>
