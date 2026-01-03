@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: videomate-backend
+    ports:
+      - "64451:64451"
+    environment:
+      - PORT=64451
+      # Initial large delay for ImageBind loading
+      - GUNICORN_TIMEOUT=300
+    env_file:
+      - ./backend/.env
+    volumes:
+      # Persist library and sessions
+      - videomate_data:/app/ds
+      # Map models directory to avoid re-downloading inside container
+      - ./models:/app/models
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: videomate-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - BACKEND_URL=http://backend:64451
+      - PORT=3000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  videomate_data:
