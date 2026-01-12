@@ -16,11 +16,9 @@ ftfy
 regex
 einops
 fvcore
-eva-decord==0.6.1
+
 iopath
-matplotlib
 types-regex
-cartopy
 
 # Audio processing and vector databases
 neo4j
@@ -40,3 +38,4 @@ psutil
 flask_cors
 setproctitle
 python-dotenv
+decord2

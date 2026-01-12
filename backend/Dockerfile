@@ -9,6 +9,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     git \
+    curl \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,6 +25,9 @@ RUN pip install --no-deps "git+https://github.com/facebookresearch/ImageBind.git
 # Copy the rest of the application
 COPY . .
 
+# Make entrypoint executable
+RUN chmod +x entrypoint.sh
+
 # Expose the API port
 EXPOSE 64451
 
@@ -31,5 +35,5 @@ EXPOSE 64451
 # PYTHONUNBUFFERED=1 ensures logs are sent directly to container logs
 ENV PYTHONUNBUFFERED=1
 
-# Run the application
-CMD ["python", "videorag_api.py"]
+# Run the application via entrypoint to handle model download
+CMD ["./entrypoint.sh"]

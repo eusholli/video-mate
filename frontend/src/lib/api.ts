@@ -110,6 +110,11 @@ export const api = {
     async generateClips(id: string, query: string): Promise<{ success: boolean; status: string }> {
         return this.post(`/api/sessions/${id}/clips`, { query });
     },
+
+    // --- Helpers ---
+    getStreamUrl(videoId: string): string {
+        return `${BASE_URL}/api/library/${videoId}/stream`;
+    },
 };
 
 export interface VideoEntry {

@@ -22,9 +22,7 @@ services:
       start_period: 600s
     volumes:
       # Persist library and sessions
-      - videomate_data:/app/ds
-      # Map models directory to avoid re-downloading inside container
-      - ./models:/app/models
+      - ./backend/ds:/app/ds
     restart: unless-stopped
 
   frontend:
@@ -41,6 +39,3 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
-
-volumes:
-  videomate_data:

@@ -20,6 +20,7 @@ import atexit
 import psutil
 import hashlib
 import shutil
+import gc
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from moviepy.editor import VideoFileClip
@@ -123,6 +124,8 @@ class GlobalImageBindManager:
 
     def initialize(self, model_path: str):
         with self._lock:
+            if self.is_initialized and self.model_path == model_path:
+                return
             self.model_path = model_path
             self.model_config = {"model_path": model_path, "configured_at": time.time()}
             self.is_initialized = True
@@ -146,7 +149,15 @@ class GlobalImageBindManager:
                     text_embed_dim=1024, text_num_blocks=24, text_num_heads=16,
                     out_embed_dim=1024, audio_drop_path=0.1, imu_drop_path=0.7,
                 )
-                self.embedder.load_state_dict(torch.load(self.model_path, map_location=device))
+                
+                # OPTIMIZATION: Use mmap=True to avoid loading entire file into RAM at once
+                # This helps fit the 4.5GB model into 8GB Docker limits
+                log_to_file(f"Memory before load: {psutil.virtual_memory().available / 1024**3:.2f} GB")
+                state_dict = torch.load(self.model_path, map_location=device, mmap=True)
+                self.embedder.load_state_dict(state_dict)
+                del state_dict
+                gc.collect()
+                
                 self.embedder = self.embedder.to(device)
                 self.embedder.eval()
                 self.is_loaded = True
@@ -191,7 +202,15 @@ class HTTPImageBindClient:
 
     def encode_video_segments(self, video_batch: List[str]) -> np.ndarray:
         res = self.session.post(f"{self.base_url}/api/imagebind/encode/video", json={"video_batch": video_batch}, timeout=1800)
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            try:
+                err_text = res.json().get("error", res.text)
+            except:
+                err_text = res.text
+            log_to_file(f"❌ HTTP Client Error in encode_video_segments: {e}. Status: {res.status_code}. Response: {err_text}")
+            raise e
         data = res.json()
         if not data["success"]: raise RuntimeError(data["error"])
         return pickle.loads(base64.b64decode(data["result"]))
@@ -814,13 +833,13 @@ def load_and_init_global_config():
         "analysisModel": os.getenv("ANALYSIS_MODEL"),
         "processingModel": os.getenv("PROCESSING_MODEL"),
         "base_storage_path": os.getenv("BASE_STORAGE_PATH"),
-        "image_bind_model_path": os.getenv("IMAGE_BIND_MODEL_PATH"),
+        "image_bind_model_path": os.getenv("IMAGE_BIND_MODEL_PATH", "/app/models/imagebind_huge.pth"),
     }
     # Init ImageBind
     if config["image_bind_model_path"]:
         global_imagebind_manager.initialize(config["image_bind_model_path"])
-        # We assume auto-load?
-        # global_imagebind_manager.ensure_imagebind_loaded() 
+        # Auto-load to ensure readiness immediately (prevents 503s on startup)
+        global_imagebind_manager.ensure_imagebind_loaded() 
     return True, "Config Loaded", config
 
 def create_app():
@@ -921,6 +940,8 @@ def create_app():
             # But for this prototype, it's sufficient.
             
         except Exception as e:
+            import traceback
+            log_to_file(f"❌ Error streaming video {video_id}: {e}\n{traceback.format_exc()}")
             return jsonify({"success": False, "error": str(e)}), 500
             
 
@@ -1378,7 +1399,10 @@ def create_app():
     # --- ImageBind Internal ---
     @app.route("/api/imagebind/status", methods=["GET"])
     def ib_status():
-        return jsonify({"success": True, "status": global_imagebind_manager.get_status()})
+        status = global_imagebind_manager.get_status()
+        if not status.get("loaded"):
+            return jsonify({"success": True, "status": status}), 503
+        return jsonify({"success": True, "status": status})
         
     @app.route("/api/imagebind/encode/video", methods=["POST"])
     def ib_encode_video():
@@ -1386,6 +1410,9 @@ def create_app():
              res = global_imagebind_manager.encode_video_segments(request.json["video_batch"])
              return jsonify({"success": True, "result": base64.b64encode(pickle.dumps(res)).decode()})
         except Exception as e:
+            import traceback
+            error_msg = f"❌ ImageBind Encode Video Failed: {e}\n{traceback.format_exc()}"
+            log_to_file(error_msg)
             return jsonify({"success": False, "error": str(e)}), 500
 
     @app.route("/api/imagebind/load", methods=["POST"])

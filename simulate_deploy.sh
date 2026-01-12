@@ -1,63 +1,65 @@
 #!/bin/bash
 set -e
 
-# Local Deployment Verification Script
-# This mimics the steps you'd strictly take on the server, but locally in a separate folder.
+# Local Deployment Verification Script (Coolify Simulation)
+# This tests if the Docker container correctly downloads the model and starts up.
 
-echo "🚀 Starting Local Deployment Test..."
+echo "🚀 Starting Local Coolify Simulation..."
 
 # 1. Create a Clean 'Remote' Directory
-# We simulate the server by creating a separate folder
 TEST_DIR="../video-mate-deploy-test"
 echo "📂 Creating clean test directory at: $TEST_DIR"
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
-# 2. 'Rsync' Code (Simulated with cp)
-# Copying only what we sending to the server
+# 2. Copy Code
 echo "📦 Copying source code..."
-rsync -av --exclude 'node_modules' --exclude '.next' --exclude 'backend/ds' --exclude '.git' --exclude 'models' \
+rsync -av --exclude 'node_modules' --exclude '.next' --exclude 'backend/ds' --exclude '.git' --exclude 'models' --exclude 'venv' --exclude '.venv' --exclude '__pycache__' \
     ./ "$TEST_DIR"
 
 # 3. Setup Environment
-echo "⚙️  Configuring Environment..."
 cd "$TEST_DIR"
-# Copy existing local env to backend .env for testing (assuming you have keys there)
-# On the real server, you'd edit this manually as per the guide.
-if [ -f "backend/.env" ]; then
-    echo "   Using existing backend/.env"
+echo "⚙️  Configuring Environment..."
+# Copy keys
+if [ -f "../video-mate/backend/.env" ]; then
+    cp "../video-mate/backend/.env" "backend/.env"
 else
-    # Fallback to copying from original location if not caught by rsync
-    cp "../video-mate/backend/.env" "backend/.env" 2>/dev/null || echo "⚠️  Could not find .env! You might need to create it manually in $TEST_DIR/backend/.env"
+    echo "⚠️  Could not find backend/.env! Please ensure it exists."
+    exit 1
 fi
 
-# Ensure paths in .env match Docker paths (simulating user edit)
-# We use sed to force these paths for the Docker test, just like the guide says
-sed -i '' 's|^BASE_STORAGE_PATH=.*|BASE_STORAGE_PATH=/app/ds|' backend/.env
-sed -i '' 's|^IMAGE_BIND_MODEL_PATH=.*|IMAGE_BIND_MODEL_PATH=/app/models/imagebind_huge.pth|' backend/.env
+# Force paths to match what Coolify would use (mapped volumes)
+# We set IMAGE_BIND_MODEL_PATH to /app/models/imagebind_huge.pth
+# And map a local folder to /app/models
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    sed -i '' 's|^BASE_STORAGE_PATH=.*|BASE_STORAGE_PATH=/app/ds|' backend/.env
+    sed -i '' 's|^IMAGE_BIND_MODEL_PATH=.*|IMAGE_BIND_MODEL_PATH=/app/models/imagebind_huge.pth|' backend/.env
+else
+    sed -i 's|^BASE_STORAGE_PATH=.*|BASE_STORAGE_PATH=/app/ds|' backend/.env
+    sed -i 's|^IMAGE_BIND_MODEL_PATH=.*|IMAGE_BIND_MODEL_PATH=/app/models/imagebind_huge.pth|' backend/.env
+fi
 
-# 4. Download Model (Simulated)
-echo "⬇️  Checking for ImageBind model..."
+# 4. Create Empty Volume Directories
 mkdir -p models
-MODEL_URL="https://dl.fbaipublicfiles.com/imagebind/imagebind_huge.pth"
-TARGET_MODEL="models/imagebind_huge.pth"
-
-# Optimization: Check if user already has it locally to avoid 4.5GB download every test
-LOCAL_MODEL_CACHE="../imagebind_huge.pth" # Look in parent? or just download.
-# For this test script, we'll try to download if missing.
-if [ -f "$TARGET_MODEL" ]; then
-    echo "   Model already exists."
-else
-    echo "   Downloading model (This may take a while)..."
-    curl -L $MODEL_URL -o $TARGET_MODEL
-fi
+mkdir -p backend/ds
 
 # 5. Build & Run Docker
-echo "🐳 Building and Starting Docker Containers..."
-# We use project name 'videomate-test' to avoid conflict with 'videomate' if running
-docker compose -p videomate-test up -d --build
+echo "🐳 Building Docker Images..."
+docker compose -p videomate-test build
 
-echo "⏳ Waiting for backend to initialize..."
-echo "   Tail the logs with: docker compose -p videomate-test logs -f backend"
-echo "   Once 'Server initialized', access at http://localhost:3000"
-echo "   To stop: docker compose -p videomate-test down"
+echo "🧪 Starting Container (Testing Auto-Download)..."
+echo "   NOTE: The first run should take time to download the 4.5GB model."
+echo "   We are NOT pre-downloading it. The container must do it."
+
+docker compose -p videomate-test up -d backend
+
+echo "⏳ Tailing logs to verify download..."
+echo "   Press Ctrl+C once you see 'Server initialized' or if it fails."
+docker compose -p videomate-test logs -f backend
+
+# Instructions for full stack
+echo ""
+echo "✅ If backend started successfully:"
+echo "   1. Start frontend: docker compose -p videomate-test up -d frontend"
+echo "   2. Visit: http://localhost:3000"
+echo "   3. Cleanup: docker compose -p videomate-test down"

@@ -135,12 +135,12 @@ export function VideoWorkspace({ sessionId }: VideoWorkspaceProps) {
                             {activeVideo ? (
                                 <video
                                     ref={videoRef}
-                                    src={`/api/library/${activeVideo.id}/stream`}
+                                    src={api.getStreamUrl(activeVideo.id)}
                                     controls
                                     className="w-full h-full"
                                     onTimeUpdate={handleTimeUpdate}
                                 >
-                                    <source src={`/api/library/${activeVideo.id}/stream`} type="video/mp4" />
+                                    <source src={api.getStreamUrl(activeVideo.id)} type="video/mp4" />
                                 </video>
                             ) : (
                                 <div className="text-muted-foreground flex flex-col items-center gap-2">
